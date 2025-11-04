@@ -1,0 +1,159 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco>
+  <compiler autolimits="true" />
+  <default>
+    <site type="sphere" rgba="1 0 0 1" size="0.005" />
+    <tendon rgba="0.2 0.2 0.2 1" />
+  </default>
+  <visual>
+    <headlight diffuse=".7 .7 .7" />
+  </visual>
+  <worldbody>
+    <body name="rotor_1_up" pos="-0.535 -0.755 1.309" euler="90 45 0">
+      <geom name="rotor_1_up" type="cylinder" size=".025 .05" />
+      <site name="top_main_site_1" pos="-0.025 0.00001 0" />
+      <site name="top_sidesite_1" pos="0 0.05 0" />
+      <body name="rotor_1_down" pos="0 -1.309 0" euler="0 0 0">
+        <geom name="rotor_1_down" type="cylinder" size=".025 .05" />
+        <site name="bot_main_site_1" pos="0.025 -0.00001 0" />
+        <site name="bot_sidesite_1" pos="0 -0.05 0" />
+        <body name="slider_1" pos="-2 0 0">
+          <inertial pos="0 0 0" mass="2" diaginertia="0.0001 0.0001 0.0001" />
+          <joint name="slider_1" type="slide" axis="-1 0 0" damping="5" />
+          <geom type="box" size="0.01 0.01 0.01" />
+          <site name="slider_1" pos="0.01 0 0" />
+        </body>
+      </body>
+    </body>
+    <body name="rotor_2_up" pos="0.755 -0.525 1.309" euler="90 135 0">
+      <geom name="rotor_2_up" type="cylinder" size=".025 .05" />
+      <site name="top_main_site_2" pos="-0.025 0.00001 0" />
+      <site name="top_sidesite_2" pos="0 0.05 0" />
+      <body name="rotor_2_down" pos="0 -1.309 0" euler="0 0 0">
+        <geom name="rotor_2_down" type="cylinder" size=".025 .05" />
+        <site name="bot_main_site_2" pos="0.025 -0.00001 0" />
+        <site name="bot_sidesite_2" pos="0 -0.05 0" />
+        <body name="slider_2" pos="-2 0 0">
+          <inertial pos="0 0 0" mass="2" diaginertia="0.0001 0.0001 0.0001" />
+          <joint name="slider_2" type="slide" axis="-1 0 0" damping="5" />
+          <geom type="box" size="0.01 0.01 0.01" />
+          <site name="slider_2" pos="0.01 0 0" />
+        </body>
+      </body>
+    </body>
+    <body name="rotor_3_up" pos="0.535 0.755 1.309" euler="90 -135 0">
+      <geom name="rotor_3_up" type="cylinder" size=".025 .05" />
+      <site name="top_main_site_3" pos="-0.025 0.00001 0" />
+      <site name="top_sidesite_3" pos="0 0.05 0" />
+      <body name="rotor_3_down" pos="0 -1.309 0" euler="0 0 0">
+        <geom name="rotor_3_down" type="cylinder" size=".025 .05" />
+        <site name="bot_main_site_3" pos="0.025 -0.00001 0" />
+        <site name="bot_sidesite_3" pos="0 -0.05 0" />
+        <body name="slider_3" pos="-2 0 0">
+          <inertial pos="0 0 0" mass="2" diaginertia="0.0001 0.0001 0.0001" />
+          <joint name="slider_3" type="slide" axis="-1 0 0" damping="5" />
+          <geom type="box" size="0.01 0.01 0.01" />
+          <site name="slider_3" pos="0.01 0 0" />
+        </body>
+      </body>
+    </body>
+    <body name="rotor_4_up" pos="-0.755 0.525 1.309" euler="90  -45 0">
+      <geom name="rotor_4_up" type="cylinder" size=".025 .05" />
+      <site name="top_main_site_4" pos="-0.025 0.00001 0" />
+      <site name="top_sidesite_4" pos="0 0.05 0" />
+      <body name="rotor_4_down" pos="0 -1.309 0" euler="0 0 0">
+        <geom name="rotor_4_down" type="cylinder" size=".025 .05" />
+        <site name="bot_main_site_4" pos="0.025 -0.00001 0" />
+        <site name="bot_sidesite_4" pos="0 -0.05 0" />
+        <body name="slider_4" pos="-2 0 0">
+          <inertial pos="0 0 0" mass="2" diaginertia="0.0001 0.0001 0.0001" />
+          <joint name="slider_4" type="slide" axis="-1 0 0" damping="5" />
+          <geom type="box" size="0.01 0.01 0.01" />
+          <site name="slider_4" pos="0.01 0 0" />
+        </body>
+      </body>
+    </body>
+    <geom name="floor" type="plane" size="5 5 0.1" pos="0 0 -0.1" rgba="0.8 0.8 0.8 1" />
+    <body name="ee_base" pos="0.0 0.0 0.25">
+      <joint name="ee_free" type="free" damping="3" armature="0.002" />
+      <inertial pos="0 0 0" mass="1.2" diaginertia="0.02 0.02 0.02" />
+      <site name="topcenter" pos="0 0 0.08" size="0.006" rgba="0 0 1 1" />
+      <body name="yaw_frame" pos="0 0 0">
+        <inertial pos="0 0 0" mass="0.15" diaginertia="0.0006 0.0006 0.0006" />
+        <joint name="ee_yaw" type="hinge" axis="0 0 1" limited="true" range="-3.1416 3.1416" damping="0.4" />
+        <body name="ee_stab" pos="0 0 0">
+          <inertial pos="0 0 0" mass="0.6" diaginertia="0.005 0.005 0.005" />
+          <joint name="ee_ball" type="ball" damping="6" stiffness="80" armature="0.02" limited="false" />
+          <body name="camera_body" pos="0 0 -0.10">
+            <camera name="ee_camera" mode="fixed" fovy="60" />
+          </body>
+          <body name="ee_platform" pos="0 0 0.08">
+            <inertial pos="0 0 0" mass="0.35" diaginertia="0.003 0.003 0.003" />
+            <geom name="palm" type="box" size="0.03 0.03 0.015" rgba="0.30 0.30 0.30 1" contype="1" conaffinity="1" />
+            <body name="finger_left_car" pos="0.035 0 0">
+              <inertial pos="0 0 0" mass="0.08" diaginertia="0.0002 0.0002 0.00015" />
+              <joint name="finger_l" type="slide" axis="1 0 0" limited="true" range="0 0.06" damping="3.0" />
+              <geom name="finger_l_link" type="box" size="0.012 0.01 0.055" pos="0 0 -0.055" rgba="0.4 0.4 0.4 1" contype="1" conaffinity="1" friction="1.5 0.02 0.01" />
+              <geom name="finger_l_tip" type="capsule" fromto="0 0 -0.11  0 0 -0.135" size="0.008" rgba="0.4 0.4 0.4 1" contype="1" conaffinity="1" friction="1.5 0.02 0.01" />
+            </body>
+            <body name="finger_right_car" pos="-0.035 0 0">
+              <inertial pos="0 0 0" mass="0.08" diaginertia="0.0002 0.0002 0.00015" />
+              <joint name="finger_r" type="slide" axis="-1 0 0" limited="true" range="0 0.06" damping="3.0" />
+              <geom name="finger_r_link" type="box" size="0.012 0.01 0.055" pos="0 0 -0.055" rgba="0.4 0.4 0.4 1" contype="1" conaffinity="1" friction="1.5 0.02 0.01" />
+              <geom name="finger_r_tip" type="capsule" fromto="0 0 -0.11  0 0 -0.135" size="0.008" rgba="0.4 0.4 0.4 1" contype="1" conaffinity="1" friction="1.5 0.02 0.01" />
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <equality>
+    <joint joint1="finger_l" joint2="finger_r" polycoef="0 1 0 0 0" />
+  </equality>
+  <tendon>
+    <spatial name="rope_1" limited="true" range="0 4.235" stiffness="0" damping="0">
+      <site site="topcenter" />
+      <geom geom="rotor_1_up" sidesite="top_sidesite_1" />
+      <site site="top_main_site_1" />
+      <site site="bot_main_site_1" />
+      <geom geom="rotor_1_down" sidesite="bot_sidesite_1" />
+      <site site="slider_1" />
+    </spatial>
+    <spatial name="rope_2" limited="true" range="0 4.235" stiffness="0" damping="0">
+      <site site="topcenter" />
+      <geom geom="rotor_2_up" sidesite="top_sidesite_2" />
+      <site site="top_main_site_2" />
+      <site site="bot_main_site_2" />
+      <geom geom="rotor_2_down" sidesite="bot_sidesite_2" />
+      <site site="slider_2" />
+    </spatial>
+    <spatial name="rope_3" limited="true" range="0 4.235" stiffness="0" damping="0">
+      <site site="topcenter" />
+      <geom geom="rotor_3_up" sidesite="top_sidesite_3" />
+      <site site="top_main_site_3" />
+      <site site="bot_main_site_3" />
+      <geom geom="rotor_3_down" sidesite="bot_sidesite_3" />
+      <site site="slider_3" />
+    </spatial>
+    <spatial name="rope_4" limited="true" range="0 4.235" stiffness="0" damping="0">
+      <site site="topcenter" />
+      <geom geom="rotor_4_up" sidesite="top_sidesite_4" />
+      <site site="top_main_site_4" />
+      <site site="bot_main_site_4" />
+      <geom geom="rotor_4_down" sidesite="bot_sidesite_4" />
+      <site site="slider_4" />
+    </spatial>
+  </tendon>
+  <actuator>
+    <position name="slider_1_pos" joint="slider_1" ctrlrange="-4.5 4.5" kp="200" kv="80" />
+    <position name="slider_2_pos" joint="slider_2" ctrlrange="-4.5 4.5" kp="200" kv="80" />
+    <position name="slider_3_pos" joint="slider_3" ctrlrange="-4.5 4.5" kp="200" kv="80" />
+    <position name="slider_4_pos" joint="slider_4" ctrlrange="-4.5 4.5" kp="200" kv="80" />
+    <position name="act_ee_yaw" joint="ee_yaw" kp="30" ctrlrange="-3.1416 3.1416" />
+    <position name="act_gripper" joint="finger_l" kp="300" ctrlrange="0 0.06" />
+  </actuator>
+  <sensor>
+    <framepos objtype="camera" objname="ee_camera" />
+    <framequat objtype="camera" objname="ee_camera" />
+  </sensor>
+</mujoco>

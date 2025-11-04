@@ -1,0 +1,18 @@
+<mujoco>
+    <compiler autolimits="true"/>
+
+    <!-- Set mesh/texture dirs for the SCENE only -->
+    <compiler meshdir="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers" texturedir="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers"/>
+    <include file="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers/living_room_table_zshift.xml"/>
+
+    <!-- Reset to neutral (our CDPR uses primitives / absolute includes) -->
+    <compiler meshdir="" texturedir=""/>
+
+    <!-- CDPR rig -->
+    <include file="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers/cdpr_ee_override.xml"/>
+
+    <!-- Placed LIBERO objects (assets already absolute) -->
+    <include file="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers/placed_0_milk.xml"/>
+<include file="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers/placed_1_cookies.xml"/>
+    </mujoco>
+    

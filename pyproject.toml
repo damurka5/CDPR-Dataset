@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cdpr_dataset"
+version = "0.1.0"
+description = "Synthetic dataset generator for CDPR in MuJoCo (RLDS/Open-X style)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "Pillow",
+    "PyYAML",
+    # optional exporters:
+    # "tensorflow>=2.12",
+    # "rlds",  # install only where you export TFRecords
+]
+
+[tool.setuptools.packages.find]
+where = ["."]

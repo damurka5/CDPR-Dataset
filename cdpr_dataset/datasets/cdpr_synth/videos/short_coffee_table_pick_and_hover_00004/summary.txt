@@ -1,0 +1,9 @@
+CDPR Trajectory Summary
+=======================
+Trajectory: short_coffee_table_pick_and_hover_00004
+Timestamp: 2025-11-04 14:33:50
+Total frames captured: 96
+Total simulation steps: 96
+Simulation time: 1.60 seconds
+Final EE position: [0.46839966 0.44758531 0.22670169]
+Final target position: [0.54 0.5  0.35]

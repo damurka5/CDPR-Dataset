@@ -1,0 +1,14 @@
+defaults:
+  scene_z: -0.85
+  ee_start: [0.0, 0.0, 0.25]
+  table_z: 0.15
+  object_dynamic: true
+  settle_time: 1.0
+
+scenes:
+  - name: desk
+    objects: [ketchup, orange_juice, alphabet_soup]
+  - name: living_room_table
+    objects: [milk, cookies]
+  - name: short_coffee_table
+    objects: [milk, cookies]
