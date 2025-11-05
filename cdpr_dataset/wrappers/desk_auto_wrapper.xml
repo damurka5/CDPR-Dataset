@@ -13,7 +13,7 @@
 
     <!-- Placed LIBERO objects (assets already absolute) -->
     <include file="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers/placed_0_ketchup.xml"/>
-<include file="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers/placed_1_orange_juice.xml"/>
-<include file="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers/placed_2_alphabet_soup.xml"/>
+<include file="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers/placed_1_milk.xml"/>
+<include file="/root/repo/CDPR_Dataset/cdpr_dataset/wrappers/placed_2_orange_juice.xml"/>
     </mujoco>
     

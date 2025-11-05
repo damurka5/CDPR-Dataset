@@ -1,162 +1,201 @@
 import numpy as np
-import mujoco as mj
+import random
 
-# Keep these aligned with your OFT runner normalization
-XYZ_BOUNDS = ((-0.8, 0.8), (-0.8, 0.8), (0.10, 1.20))
-GRIP_RANGE = (0.0, 0.06)
+# ===== Constants =====
+# XYZ bounds for safety (clamped). Tune to your workspace.
+XYZ_BOUNDS = {
+    "x": (-0.90, 0.90),
+    "y": (-0.90, 0.90),
+    "z": (0.05, 0.60),   # never command below 5cm above floor
+}
 
+# Gripper range in meters (opening distance used by your sim helpers)
+GRIP_RANGE = (0.0, 0.03)
+
+# Default safety/tolerance parameters
+DEFAULT_TOL = 0.03         # 3 cm tolerance
+DEFAULT_SAFETY_Z = 0.35    # "up" height before moving laterally
+DEFAULT_GRASP_Z = 0.06     # approach height for picking
+DEFAULT_LIFT_Z  = 0.30     # lift height after grasp
+
+# ---- utility clamps ----
 def clamp(v, lo, hi):
     return float(max(lo, min(hi, v)))
 
-def norm11(v, lo, hi):
-    return 2.0 * ((np.clip(v, lo, hi) - lo) / (hi - lo + 1e-9)) - 1.0
+def clamp_xyz(xyz):
+    return np.array([
+        clamp(xyz[0], *XYZ_BOUNDS["x"]),
+        clamp(xyz[1], *XYZ_BOUNDS["y"]),
+        clamp(xyz[2], *XYZ_BOUNDS["z"]),
+    ], dtype=float)
 
-def make_proprio(sim, normalize=True):
-    ee = sim.get_end_effector_position().astype(np.float32)
-    yaw = float(sim.get_yaw()) if hasattr(sim, "get_yaw") else 0.0
-    grip = float(getattr(sim, "get_gripper_opening", lambda: 0.03)())
-    if normalize:
-        (xlo,xhi),(ylo,yhi),(zlo,zhi) = XYZ_BOUNDS
-        g0,g1 = GRIP_RANGE
-        state = np.array([
-            norm11(ee[0], xlo, xhi),
-            norm11(ee[1], ylo, yhi),
-            norm11(ee[2], zlo, zhi),
-            np.clip(yaw/np.pi, -1, 1),
-            0.0, 0.0, 0.0,
-            norm11(grip, g0, g1),
-        ], dtype=np.float32)
-    else:
-        state = np.array([ee[0], ee[1], ee[2], yaw, 0,0,0, grip], dtype=np.float32)
-    return state
+# ---- Waypoint planner ----
+def plan_pick_waypoints(sim, target_xyz, safety_z=DEFAULT_SAFETY_Z, grasp_z=DEFAULT_GRASP_Z):
+    """
+    Build a conservative waypoint list:
+      1) Rise to max(current_z, safety_z)
+      2) Lateral move above the target at 'safety_z'
+      3) Descend straight down to 'grasp_z' (clamped)
+    """
+    cur = sim.get_end_effector_position().copy()
+    up1 = cur.copy(); up1[2] = max(cur[2], safety_z)
+    above = np.array([target_xyz[0], target_xyz[1], up1[2]], dtype=float)
+    down = np.array([target_xyz[0], target_xyz[1], grasp_z], dtype=float)
+    waypoints = [clamp_xyz(up1), clamp_xyz(above), clamp_xyz(down)]
+    # Deduplicate near-identical consecutive points
+    filtered = [waypoints[0]]
+    for p in waypoints[1:]:
+        if np.linalg.norm(p - filtered[-1]) > 1e-6:
+            filtered.append(p)
+    return filtered
 
-def capture_obs(sim, task_text):
-    full_rgb  = sim.capture_frame(sim.overview_cam, "overview")
-    wrist_rgb = sim.capture_frame(sim.ee_cam, "ee_camera")
-    return {
-        "full_image":  np.ascontiguousarray(full_rgb,  dtype=np.uint8),
-        "wrist_image": np.ascontiguousarray(wrist_rgb, dtype=np.uint8),
-        "state":       make_proprio(sim, normalize=True),
-        "task_description": task_text,
-    }
+# ---- High-level scripts ----
+def script_pick_and_hover(sim,
+                          object_body_name="target_object",
+                          yaw=0.0,
+                          tol=DEFAULT_TOL,
+                          safety_z=DEFAULT_SAFETY_Z,
+                          grasp_z=DEFAULT_GRASP_Z,
+                          lift_z=DEFAULT_LIFT_Z,
+                          **kwargs):
+    """
+    Execute a robust pick:
+      - open gripper
+      - up → above target → down  (3 cm tolerance)
+      - close gripper
+      - lift to 'lift_z'
+    Accepts extra kwargs (ignored) to stay compatible with older runners.
+    """
+    # Ensure controller starts “neutral”
+    if hasattr(sim, "hold_current_pose"):
+        sim.hold_current_pose(warm_steps=20)
 
-def action_abs_7(xyz, yaw, grip):
-    return np.array([xyz[0], xyz[1], xyz[2], float(yaw), 0.0, 0.0, float(grip)], dtype=np.float32)
+    # Open gripper before approach
+    if hasattr(sim, "open_gripper"):
+        sim.open_gripper()
 
-def action_delta_7(dxyz, dyaw, dgrip):
-    return np.array([dxyz[0], dxyz[1], dxyz[2], float(dyaw), 0.0, 0.0, float(dgrip)], dtype=np.float32)
+    # Plan waypoint path and execute with tolerance
+    tgt = sim.get_target_position().copy()
+    waypoints = plan_pick_waypoints(sim, tgt, safety_z=safety_z, grasp_z=grasp_z)
+    for p in waypoints:
+        ok, _ = sim.goto(p, max_steps=600, tol=tol)
+        # add a few settling steps for stability
+        for _ in range(10):
+            sim.run_simulation_step(capture_frame=False)
 
-def step_to(sim, xyz_target, yaw_target=None, grip_target=None, inner=2):
-    if xyz_target is not None: sim.set_target_position(np.array(xyz_target, dtype=float))
-    if yaw_target is not None and hasattr(sim, "set_yaw"): sim.set_yaw(float(yaw_target))
-    if grip_target is not None and hasattr(sim, "set_gripper"): sim.set_gripper(float(grip_target))
-    for _ in range(inner):
-        sim.run_simulation_step(capture_frame=True)
+    # Close, then lift
+    if hasattr(sim, "close_gripper"):
+        sim.close_gripper()
+        for _ in range(30):
+            sim.run_simulation_step(capture_frame=False)
 
-def find_body_xy(sim, name_prefix=("p0_", "p1_", "p2_", "p3_", "p4_")):
-    # prefers placed objects created by the scene switcher
-    for bid in range(sim.model.nbody):
-        nm = mj.mj_id2name(sim.model, mj.mjtObj.mjOBJ_BODY, bid)
-        if nm and any(nm.startswith(pfx) for pfx in name_prefix):
-            return sim.data.xpos[bid, :2].copy(), nm
-    try:
-        return sim.get_target_position()[:2].copy(), "target_object"
-    except Exception:
-        return sim.get_end_effector_position()[:2].copy(), "ee"
+    up_after = np.array([tgt[0], tgt[1], lift_z], dtype=float)
+    sim.goto(clamp_xyz(up_after), max_steps=600, tol=tol)
+    for _ in range(10):
+        sim.run_simulation_step(capture_frame=False)
 
-def script_pick_and_hover(sim, target_xy=None, z_grasp=0.18, z_lift=0.35, yaw=0.0,
-                          approach_offset=(0.0, 0.0), task_text="Pick up the object, then hover."):
-    logs = []
-    if target_xy is None:
-        xy, _ = find_body_xy(sim)
-    else:
-        xy = np.array(target_xy[:2], dtype=float)
-    xy = xy + np.array(approach_offset, dtype=float)
+def script_push(sim,
+                direction="left",
+                distance=0.20,
+                safety_z=DEFAULT_SAFETY_Z,
+                approach_z=0.08,
+                yaw=0.0,
+                tol=DEFAULT_TOL,
+                **kwargs):
+    """
+    Push along a straight line at a constant Z:
+      - go up to safety
+      - move above object
+      - descend to low approach height
+      - push along +x/-x/+y/-y by 'distance'
+    Accepts extra kwargs (ignored) to stay compatible with older runners.
+    """
+    tgt = sim.get_target_position().copy()
 
-    ee = sim.get_end_effector_position().copy()
-    yaw_now = float(sim.get_yaw()) if hasattr(sim, "get_yaw") else 0.0
-    grip_now = float(getattr(sim, "get_gripper_opening", lambda: 0.03)())
+    if hasattr(sim, "hold_current_pose"):
+        sim.hold_current_pose(warm_steps=10)
+    if hasattr(sim, "open_gripper"):
+        sim.open_gripper()
 
-    waypoints = [
-        (np.array([xy[0], xy[1], max(ee[2], z_lift)]), yaw, grip_now),
-        (np.array([xy[0], xy[1], z_grasp + 0.07]),      yaw, grip_now),
-        (np.array([xy[0], xy[1], z_grasp]),             yaw, grip_now),
-    ]
-    for wp_xyz, wp_yaw, wp_grip in waypoints:
-        prev = sim.get_end_effector_position().copy()
-        prev_yaw = yaw_now; prev_grip = grip_now
-        step_to(sim, wp_xyz, wp_yaw, wp_grip, inner=12)
-        obs = capture_obs(sim, task_text)
-        dxyz = sim.get_end_effector_position().copy() - prev
-        dyaw = (wp_yaw - prev_yaw) if yaw is not None else 0.0
-        dgrip= (wp_grip - prev_grip)
-        logs.append((obs, action_abs_7(wp_xyz, wp_yaw, wp_grip), action_delta_7(dxyz, dyaw, dgrip)))
-        yaw_now = wp_yaw; grip_now = wp_grip
+    # up & above
+    up1 = np.array([tgt[0], tgt[1], max(sim.get_end_effector_position()[2], safety_z)], dtype=float)
+    sim.goto(clamp_xyz(up1), max_steps=600, tol=tol)
+    above = np.array([tgt[0], tgt[1], safety_z], dtype=float)
+    sim.goto(clamp_xyz(above), max_steps=600, tol=tol)
 
-    # close gripper
-    prev = sim.get_end_effector_position().copy()
-    prev_yaw = yaw_now; prev_grip = grip_now
-    step_to(sim, None, yaw, GRIP_RANGE[0], inner=20)
-    obs = capture_obs(sim, task_text)
-    dxyz = sim.get_end_effector_position().copy() - prev
-    dyaw = (yaw - prev_yaw)
-    dgrip = (GRIP_RANGE[0] - prev_grip)
-    logs.append((obs, action_abs_7(sim.get_end_effector_position(), yaw, GRIP_RANGE[0]),
-                 action_delta_7(dxyz, dyaw, dgrip)))
-    grip_now = GRIP_RANGE[0]
+    # down to approach height (not touching table)
+    down = np.array([tgt[0], tgt[1], approach_z], dtype=float)
+    sim.goto(clamp_xyz(down), max_steps=600, tol=tol)
 
-    # lift
-    lift_xyz = np.array([xy[0], xy[1], z_lift])
-    prev = sim.get_end_effector_position().copy()
-    prev_yaw = yaw_now; prev_grip = grip_now
-    step_to(sim, lift_xyz, yaw, grip_now, inner=20)
-    obs = capture_obs(sim, task_text)
-    dxyz = sim.get_end_effector_position().copy() - prev
-    dyaw = (yaw - prev_yaw)
-    dgrip = (grip_now - prev_grip)
-    logs.append((obs, action_abs_7(lift_xyz, yaw, grip_now), action_delta_7(dxyz, dyaw, dgrip)))
-
-    # small hover move
-    hover2 = lift_xyz + np.array([0.04, 0.0, 0.0])
-    prev = sim.get_end_effector_position().copy()
-    prev_yaw = yaw_now; prev_grip = grip_now
-    step_to(sim, hover2, yaw, grip_now, inner=20)
-    obs = capture_obs(sim, task_text)
-    dxyz = sim.get_end_effector_position().copy() - prev
-    dyaw = (yaw - prev_yaw)
-    dgrip = (grip_now - prev_grip)
-    logs.append((obs, action_abs_7(hover2, yaw, grip_now), action_delta_7(dxyz, dyaw, dgrip)))
-
-    return logs
-
-def script_push(sim, direction="left", distance=0.15, z_contact=0.18, yaw=0.0,
-                task_text="Push the object."):
-    logs = []
-    xy, _ = find_body_xy(sim)
-    start_above = np.array([xy[0], xy[1], z_contact + 0.08])
-    path = [start_above,
-            np.array([xy[0], xy[1], z_contact])]
+    # lateral push
+    dx, dy = 0.0, 0.0
+    d = abs(float(distance))
     if direction == "left":
-        path.append(np.array([xy[0]-distance, xy[1], z_contact]))
+        dx = -d
     elif direction == "right":
-        path.append(np.array([xy[0]+distance, xy[1], z_contact]))
-    elif direction == "forward":      # +Y
-        path.append(np.array([xy[0], xy[1]+distance, z_contact]))
-    else:                              # backward (-Y)
-        path.append(np.array([xy[0], xy[1]-distance, z_contact]))
-    path.append(start_above)  # retract
+        dx =  d
+    elif direction == "forward":
+        dy =  d
+    elif direction == "back":
+        dy = -d
+    goal = np.array([down[0] + dx, down[1] + dy, down[2]], dtype=float)
+    sim.goto(clamp_xyz(goal), max_steps=800, tol=tol)
 
-    grip = GRIP_RANGE[1]  # open
-    prev_xyz = None; prev_yaw = yaw; prev_grip = grip
-    for k, xyz in enumerate(path):
-        if prev_xyz is None:
-            prev_xyz = xyz.copy()
-        step_to(sim, xyz, yaw, grip, inner=12)
-        obs = capture_obs(sim, task_text)
-        cur_xyz = sim.get_end_effector_position().copy()
-        dxyz = cur_xyz - prev_xyz
-        dyaw = 0.0
-        dgrip = 0.0
-        logs.append((obs, action_abs_7(cur_xyz, yaw, grip), action_delta_7(dxyz, dyaw, dgrip)))
-        prev_xyz = cur_xyz
-    return logs
+# ===== Simple non-overlap object placement =====
+
+def _geom_footprint_radius(model, geom_id):
+    """Approximate XY footprint radius from geom type/size."""
+    gtype = model.geom_type[geom_id]
+    size = model.geom_size[geom_id]
+    # mjtGeom: 6=box, 4=cylinder, 0=sphere. Handle common ones; fallback ~4 cm.
+    if gtype == 6:  # box
+        r = float(np.linalg.norm(size[:2]))  # diagonal half-length in XY
+        return max(0.03, r)
+    elif gtype == 4 or gtype == 0:  # cylinder or sphere
+        return max(0.03, float(size[0]))
+    else:
+        return 0.04
+
+def place_objects_non_overlapping(sim, object_body_names, xy_bounds, min_gap=0.02, max_tries=200):
+    """
+    Randomly place objects by setting their body pose XY at a fixed Z, avoiding XY overlap.
+    - xy_bounds = ((xmin, xmax), (ymin, ymax), fixed_z)
+    - Uses each body's first geom footprint to estimate radius.
+    """
+    import mujoco as mj
+    model, data = sim.model, sim.data
+    xmin, xmax = xy_bounds[0]; ymin, ymax = xy_bounds[1]; z_fixed = xy_bounds[2]
+
+    placed = []
+    for name in object_body_names:
+        bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name)
+        geom_ids = np.where(model.geom_bodyid == bid)[0]
+        r = 0.05
+        if len(geom_ids) > 0:
+            r = _geom_footprint_radius(model, int(geom_ids[0]))
+        ok = False
+        for _ in range(max_tries):
+            x = random.uniform(xmin + r, xmax - r)
+            y = random.uniform(ymin + r, ymax - r)
+            if all((x - px)**2 + (y - py)**2 >= (r + pr + min_gap)**2 for (px, py, pr) in placed):
+                # Try free joint first (typical for movable objects)
+                j = model.body_jntnum[bid]
+                jadr = model.body_jntadr[bid]
+                free_found = False
+                for k in range(j):
+                    jid = jadr + k
+                    if model.jnt_type[jid] == mj.mjtJoint.mjJNT_FREE:
+                        qadr = model.jnt_qposadr[jid]
+                        data.qpos[qadr:qadr+3] = np.array([x, y, z_fixed], dtype=float)
+                        free_found = True
+                        break
+                if not free_found:
+                    # fallback: move kinematic body via xpos (rare for LIBERO objects)
+                    data.xpos[bid] = np.array([x, y, z_fixed], dtype=float)
+                placed.append((x, y, r))
+                ok = True
+                break
+        if not ok:
+            raise RuntimeError(f"Could not place object '{name}' without overlap in {max_tries} tries.")
+    mj.mj_forward(model, data)
+    return [(px, py) for (px, py, _) in placed]
