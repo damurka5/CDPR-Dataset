@@ -1,24 +1,35 @@
 import numpy as np
 import random
 
-# ===== Constants =====
-# XYZ bounds for safety (clamped). Tune to your workspace.
+# ===== Safety & motion defaults =====
 XYZ_BOUNDS = {
     "x": (-0.90, 0.90),
     "y": (-0.90, 0.90),
     "z": (0.05, 0.60),   # never command below 5cm above floor
 }
 
-# Gripper range in meters (opening distance used by your sim helpers)
 GRIP_RANGE = (0.0, 0.03)
 
-# Default safety/tolerance parameters
+# Tolerances / heights
 DEFAULT_TOL = 0.03         # 3 cm tolerance
 DEFAULT_SAFETY_Z = 0.35    # "up" height before moving laterally
 DEFAULT_GRASP_Z = 0.06     # approach height for picking
 DEFAULT_LIFT_Z  = 0.30     # lift height after grasp
 
-# ---- utility clamps ----
+# Timing for smooth segments (in seconds)
+# Tune these to slow down or speed up the robot motion.
+SEG_T_UP_S      = 1.5
+SEG_T_LATERAL_S = 2.0
+SEG_T_DOWN_S    = 1.2
+SEG_T_PUSH_S    = 2.0     # time spent on the lateral push leg
+
+# Short settling after each leg (simulation steps)
+SETTLE_STEPS = 20
+
+# Small fallback budget if we still need to “snap in” to the exact goal
+FALLBACK_MAX_STEPS = 120
+
+# ---- utilities ----
 def clamp(v, lo, hi):
     return float(max(lo, min(hi, v)))
 
@@ -28,6 +39,34 @@ def clamp_xyz(xyz):
         clamp(xyz[1], *XYZ_BOUNDS["y"]),
         clamp(xyz[2], *XYZ_BOUNDS["z"]),
     ], dtype=float)
+
+def minjerk(u: float) -> float:
+    """Smooth step from 0→1 with zero vel/accel at ends."""
+    u = float(max(0.0, min(1.0, u)))
+    return u**3 * (10 - 15*u + 6*u*u)
+
+def follow_segment_minjerk(sim, start_xyz, goal_xyz, duration_s, capture_every_n=3):
+    """
+    Time-parameterized smooth segment: we 'ramp' the target position along a
+    min-jerk curve so velocity is gentle. No hard goto() here.
+    """
+    start = np.array(start_xyz, dtype=float)
+    goal  = clamp_xyz(goal_xyz)
+    dt = float(sim.controller.dt) if hasattr(sim, "controller") else 1.0/60.0
+    steps = max(1, int(round(duration_s / dt)))
+
+    for k in range(steps):
+        u = (k+1) / steps
+        s = minjerk(u)
+        p = start + s * (goal - start)
+        sim.set_target_position(p)
+        # use the usual sim step; skip excessive frame capture to keep videos compact
+        capture = ((k % capture_every_n) == 0)
+        sim.run_simulation_step(capture_frame=capture)
+
+def settle(sim, steps=SETTLE_STEPS):
+    for _ in range(int(steps)):
+        sim.run_simulation_step(capture_frame=False)
 
 # ---- Waypoint planner ----
 def plan_pick_waypoints(sim, target_xyz, safety_z=DEFAULT_SAFETY_Z, grasp_z=DEFAULT_GRASP_Z):
@@ -59,40 +98,52 @@ def script_pick_and_hover(sim,
                           lift_z=DEFAULT_LIFT_Z,
                           **kwargs):
     """
-    Execute a robust pick:
+    Robust pick with smooth motion:
       - open gripper
-      - up → above target → down  (3 cm tolerance)
+      - up → above target → down (min-jerk segments)
+      - short fallback goto with small step budget
       - close gripper
-      - lift to 'lift_z'
-    Accepts extra kwargs (ignored) to stay compatible with older runners.
+      - lift smoothly to 'lift_z'
     """
-    # Ensure controller starts “neutral”
     if hasattr(sim, "hold_current_pose"):
         sim.hold_current_pose(warm_steps=20)
-
-    # Open gripper before approach
     if hasattr(sim, "open_gripper"):
         sim.open_gripper()
 
-    # Plan waypoint path and execute with tolerance
     tgt = sim.get_target_position().copy()
     waypoints = plan_pick_waypoints(sim, tgt, safety_z=safety_z, grasp_z=grasp_z)
-    for p in waypoints:
-        ok, _ = sim.goto(p, max_steps=600, tol=tol)
-        # add a few settling steps for stability
-        for _ in range(10):
-            sim.run_simulation_step(capture_frame=False)
+
+    # Segment 1: up
+    cur = sim.get_end_effector_position().copy()
+    follow_segment_minjerk(sim, cur, waypoints[0], SEG_T_UP_S)
+    # fallback tighten
+    sim.set_target_position(waypoints[0])
+    sim.goto(waypoints[0], max_steps=FALLBACK_MAX_STEPS, tol=tol)
+    settle(sim)
+
+    # Segment 2: lateral above
+    follow_segment_minjerk(sim, waypoints[0], waypoints[1], SEG_T_LATERAL_S)
+    sim.set_target_position(waypoints[1])
+    sim.goto(waypoints[1], max_steps=FALLBACK_MAX_STEPS, tol=tol)
+    settle(sim)
+
+    # Segment 3: down
+    follow_segment_minjerk(sim, waypoints[1], waypoints[2], SEG_T_DOWN_S)
+    sim.set_target_position(waypoints[2])
+    sim.goto(waypoints[2], max_steps=FALLBACK_MAX_STEPS, tol=tol)
+    settle(sim)
 
     # Close, then lift
     if hasattr(sim, "close_gripper"):
         sim.close_gripper()
-        for _ in range(30):
-            sim.run_simulation_step(capture_frame=False)
+        settle(sim, steps=30)
 
-    up_after = np.array([tgt[0], tgt[1], lift_z], dtype=float)
-    sim.goto(clamp_xyz(up_after), max_steps=600, tol=tol)
-    for _ in range(10):
-        sim.run_simulation_step(capture_frame=False)
+    lift_goal = np.array([tgt[0], tgt[1], lift_z], dtype=float)
+    cur = sim.get_end_effector_position().copy()
+    follow_segment_minjerk(sim, cur, lift_goal, SEG_T_UP_S)   # reuse up timing for the lift
+    sim.set_target_position(clamp_xyz(lift_goal))
+    sim.goto(clamp_xyz(lift_goal), max_steps=FALLBACK_MAX_STEPS, tol=tol)
+    settle(sim)
 
 def script_push(sim,
                 direction="left",
@@ -103,12 +154,12 @@ def script_push(sim,
                 tol=DEFAULT_TOL,
                 **kwargs):
     """
-    Push along a straight line at a constant Z:
-      - go up to safety
-      - move above object
-      - descend to low approach height
-      - push along +x/-x/+y/-y by 'distance'
-    Accepts extra kwargs (ignored) to stay compatible with older runners.
+    Push along a straight line with smooth segments:
+      - up to safety (smooth)
+      - move above object (smooth)
+      - descend to approach height (smooth)
+      - push laterally (smooth)
+      - each leg finishes with short fallback tightening & settle
     """
     tgt = sim.get_target_position().copy()
 
@@ -117,17 +168,29 @@ def script_push(sim,
     if hasattr(sim, "open_gripper"):
         sim.open_gripper()
 
-    # up & above
-    up1 = np.array([tgt[0], tgt[1], max(sim.get_end_effector_position()[2], safety_z)], dtype=float)
-    sim.goto(clamp_xyz(up1), max_steps=600, tol=tol)
-    above = np.array([tgt[0], tgt[1], safety_z], dtype=float)
-    sim.goto(clamp_xyz(above), max_steps=600, tol=tol)
+    # up
+    cur = sim.get_end_effector_position().copy()
+    up_goal = np.array([cur[0], cur[1], max(cur[2], safety_z)], dtype=float)
+    follow_segment_minjerk(sim, cur, up_goal, SEG_T_UP_S)
+    sim.set_target_position(clamp_xyz(up_goal))
+    sim.goto(clamp_xyz(up_goal), max_steps=FALLBACK_MAX_STEPS, tol=tol)
+    settle(sim)
 
-    # down to approach height (not touching table)
+    # above
+    above = np.array([tgt[0], tgt[1], up_goal[2]], dtype=float)
+    follow_segment_minjerk(sim, up_goal, above, SEG_T_LATERAL_S)
+    sim.set_target_position(clamp_xyz(above))
+    sim.goto(clamp_xyz(above), max_steps=FALLBACK_MAX_STEPS, tol=tol)
+    settle(sim)
+
+    # down to approach
     down = np.array([tgt[0], tgt[1], approach_z], dtype=float)
-    sim.goto(clamp_xyz(down), max_steps=600, tol=tol)
+    follow_segment_minjerk(sim, above, down, SEG_T_DOWN_S)
+    sim.set_target_position(clamp_xyz(down))
+    sim.goto(clamp_xyz(down), max_steps=FALLBACK_MAX_STEPS, tol=tol)
+    settle(sim)
 
-    # lateral push
+    # push laterally
     dx, dy = 0.0, 0.0
     d = abs(float(distance))
     if direction == "left":
@@ -139,10 +202,13 @@ def script_push(sim,
     elif direction == "back":
         dy = -d
     goal = np.array([down[0] + dx, down[1] + dy, down[2]], dtype=float)
-    sim.goto(clamp_xyz(goal), max_steps=800, tol=tol)
+
+    follow_segment_minjerk(sim, down, goal, SEG_T_PUSH_S)
+    sim.set_target_position(clamp_xyz(goal))
+    sim.goto(clamp_xyz(goal), max_steps=FALLBACK_MAX_STEPS, tol=tol)
+    settle(sim)
 
 # ===== Simple non-overlap object placement =====
-
 def _geom_footprint_radius(model, geom_id):
     """Approximate XY footprint radius from geom type/size."""
     gtype = model.geom_type[geom_id]
@@ -161,6 +227,7 @@ def place_objects_non_overlapping(sim, object_body_names, xy_bounds, min_gap=0.0
     Randomly place objects by setting their body pose XY at a fixed Z, avoiding XY overlap.
     - xy_bounds = ((xmin, xmax), (ymin, ymax), fixed_z)
     - Uses each body's first geom footprint to estimate radius.
+    For single-object episodes, just pass ['target_object'].
     """
     import mujoco as mj
     model, data = sim.model, sim.data
