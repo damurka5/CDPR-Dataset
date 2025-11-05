@@ -1,0 +1,9 @@
+CDPR Trajectory Summary
+=======================
+Trajectory: desk__cookies_wrapper_push_left_2025-11-05_13-42-34
+Timestamp: 2025-11-05 13:42:35
+Total frames captured: 346
+Total simulation steps: 1128
+Simulation time: 18.80 seconds
+Final EE position: [0.2527507  0.36619693 0.09224196]
+Final target position: [0.2  0.4  0.08]

@@ -1,0 +1,9 @@
+CDPR Trajectory Summary
+=======================
+Trajectory: desk__milk_wrapper_pick_and_hover_2025-11-05_13-42-07
+Timestamp: 2025-11-05 13:42:07
+Total frames captured: 284
+Total simulation steps: 962
+Simulation time: 16.37 seconds
+Final EE position: [0.36270325 0.36242312 0.23238933]
+Final target position: [0.3999999 0.4000004 0.3      ]

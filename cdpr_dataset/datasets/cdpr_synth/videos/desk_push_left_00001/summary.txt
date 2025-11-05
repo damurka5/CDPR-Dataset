@@ -1,9 +1,0 @@
-CDPR Trajectory Summary
-=======================
-Trajectory: desk_push_left_00001
-Timestamp: 2025-11-04 14:33:26
-Total frames captured: 48
-Total simulation steps: 48
-Simulation time: 0.80 seconds
-Final EE position: [0.22712281 0.25806318 0.10598298]
-Final target position: [0.5  0.5  0.26]

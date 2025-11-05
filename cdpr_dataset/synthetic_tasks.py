@@ -17,19 +17,13 @@ DEFAULT_GRASP_Z = 0.06     # approach height for picking
 DEFAULT_LIFT_Z  = 0.30     # lift height after grasp
 
 # Timing for smooth segments (in seconds)
-# Tune these to slow down or speed up the robot motion.
 SEG_T_UP_S      = 1.5
 SEG_T_LATERAL_S = 2.0
 SEG_T_DOWN_S    = 1.2
-SEG_T_PUSH_S    = 2.0     # time spent on the lateral push leg
-
-# Short settling after each leg (simulation steps)
+SEG_T_PUSH_S    = 2.0
 SETTLE_STEPS = 20
-
-# Small fallback budget if we still need to “snap in” to the exact goal
 FALLBACK_MAX_STEPS = 120
 
-# ---- utilities ----
 def clamp(v, lo, hi):
     return float(max(lo, min(hi, v)))
 
@@ -41,26 +35,19 @@ def clamp_xyz(xyz):
     ], dtype=float)
 
 def minjerk(u: float) -> float:
-    """Smooth step from 0→1 with zero vel/accel at ends."""
     u = float(max(0.0, min(1.0, u)))
     return u**3 * (10 - 15*u + 6*u*u)
 
 def follow_segment_minjerk(sim, start_xyz, goal_xyz, duration_s, capture_every_n=3):
-    """
-    Time-parameterized smooth segment: we 'ramp' the target position along a
-    min-jerk curve so velocity is gentle. No hard goto() here.
-    """
     start = np.array(start_xyz, dtype=float)
     goal  = clamp_xyz(goal_xyz)
     dt = float(sim.controller.dt) if hasattr(sim, "controller") else 1.0/60.0
     steps = max(1, int(round(duration_s / dt)))
-
     for k in range(steps):
         u = (k+1) / steps
         s = minjerk(u)
         p = start + s * (goal - start)
         sim.set_target_position(p)
-        # use the usual sim step; skip excessive frame capture to keep videos compact
         capture = ((k % capture_every_n) == 0)
         sim.run_simulation_step(capture_frame=capture)
 
@@ -68,27 +55,19 @@ def settle(sim, steps=SETTLE_STEPS):
     for _ in range(int(steps)):
         sim.run_simulation_step(capture_frame=False)
 
-# ---- Waypoint planner ----
+# ---- Waypoint planner (pick) ----
 def plan_pick_waypoints(sim, target_xyz, safety_z=DEFAULT_SAFETY_Z, grasp_z=DEFAULT_GRASP_Z):
-    """
-    Build a conservative waypoint list:
-      1) Rise to max(current_z, safety_z)
-      2) Lateral move above the target at 'safety_z'
-      3) Descend straight down to 'grasp_z' (clamped)
-    """
     cur = sim.get_end_effector_position().copy()
     up1 = cur.copy(); up1[2] = max(cur[2], safety_z)
     above = np.array([target_xyz[0], target_xyz[1], up1[2]], dtype=float)
     down = np.array([target_xyz[0], target_xyz[1], grasp_z], dtype=float)
     waypoints = [clamp_xyz(up1), clamp_xyz(above), clamp_xyz(down)]
-    # Deduplicate near-identical consecutive points
     filtered = [waypoints[0]]
     for p in waypoints[1:]:
         if np.linalg.norm(p - filtered[-1]) > 1e-6:
             filtered.append(p)
     return filtered
 
-# ---- High-level scripts ----
 def script_pick_and_hover(sim,
                           object_body_name="target_object",
                           yaw=0.0,
@@ -97,14 +76,6 @@ def script_pick_and_hover(sim,
                           grasp_z=DEFAULT_GRASP_Z,
                           lift_z=DEFAULT_LIFT_Z,
                           **kwargs):
-    """
-    Robust pick with smooth motion:
-      - open gripper
-      - up → above target → down (min-jerk segments)
-      - short fallback goto with small step budget
-      - close gripper
-      - lift smoothly to 'lift_z'
-    """
     if hasattr(sim, "hold_current_pose"):
         sim.hold_current_pose(warm_steps=20)
     if hasattr(sim, "open_gripper"):
@@ -113,37 +84,41 @@ def script_pick_and_hover(sim,
     tgt = sim.get_target_position().copy()
     waypoints = plan_pick_waypoints(sim, tgt, safety_z=safety_z, grasp_z=grasp_z)
 
-    # Segment 1: up
     cur = sim.get_end_effector_position().copy()
     follow_segment_minjerk(sim, cur, waypoints[0], SEG_T_UP_S)
-    # fallback tighten
-    sim.set_target_position(waypoints[0])
-    sim.goto(waypoints[0], max_steps=FALLBACK_MAX_STEPS, tol=tol)
-    settle(sim)
+    sim.set_target_position(waypoints[0]); sim.goto(waypoints[0], max_steps=FALLBACK_MAX_STEPS, tol=tol); settle(sim)
 
-    # Segment 2: lateral above
     follow_segment_minjerk(sim, waypoints[0], waypoints[1], SEG_T_LATERAL_S)
-    sim.set_target_position(waypoints[1])
-    sim.goto(waypoints[1], max_steps=FALLBACK_MAX_STEPS, tol=tol)
-    settle(sim)
+    sim.set_target_position(waypoints[1]); sim.goto(waypoints[1], max_steps=FALLBACK_MAX_STEPS, tol=tol); settle(sim)
 
-    # Segment 3: down
     follow_segment_minjerk(sim, waypoints[1], waypoints[2], SEG_T_DOWN_S)
-    sim.set_target_position(waypoints[2])
-    sim.goto(waypoints[2], max_steps=FALLBACK_MAX_STEPS, tol=tol)
-    settle(sim)
+    sim.set_target_position(waypoints[2]); sim.goto(waypoints[2], max_steps=FALLBACK_MAX_STEPS, tol=tol); settle(sim)
 
-    # Close, then lift
     if hasattr(sim, "close_gripper"):
-        sim.close_gripper()
-        settle(sim, steps=30)
+        sim.close_gripper(); settle(sim, steps=30)
 
     lift_goal = np.array([tgt[0], tgt[1], lift_z], dtype=float)
     cur = sim.get_end_effector_position().copy()
-    follow_segment_minjerk(sim, cur, lift_goal, SEG_T_UP_S)   # reuse up timing for the lift
-    sim.set_target_position(clamp_xyz(lift_goal))
-    sim.goto(clamp_xyz(lift_goal), max_steps=FALLBACK_MAX_STEPS, tol=tol)
-    settle(sim)
+    follow_segment_minjerk(sim, cur, lift_goal, SEG_T_UP_S)
+    sim.set_target_position(clamp_xyz(lift_goal)); sim.goto(clamp_xyz(lift_goal), max_steps=FALLBACK_MAX_STEPS, tol=tol); settle(sim)
+
+# ---- True push behavior (side approach, gripper open, yaw set for pushing) ----
+def _dir_vec(direction: str):
+    if direction == "left":   return np.array([-1.0,  0.0, 0.0], dtype=float)
+    if direction == "right":  return np.array([ 1.0,  0.0, 0.0], dtype=float)
+    if direction == "forward":return np.array([ 0.0,  1.0, 0.0], dtype=float)
+    if direction == "back":   return np.array([ 0.0, -1.0, 0.0], dtype=float)
+    return np.array([-1.0, 0.0, 0.0], dtype=float)  # default left
+
+def _yaw_for_push(direction: str):
+    """
+    Align the finger bar as a flat pusher:
+    - pushing along ±X → yaw = 0 (fingers across Y)
+    - pushing along ±Y → yaw = pi/2 (fingers across X)
+    """
+    import math
+    if direction in ("left", "right"):   return 0.0
+    else:                                 return math.pi/2
 
 def script_push(sim,
                 direction="left",
@@ -154,66 +129,63 @@ def script_push(sim,
                 tol=DEFAULT_TOL,
                 **kwargs):
     """
-    Push along a straight line with smooth segments:
-      - up to safety (smooth)
-      - move above object (smooth)
-      - descend to approach height (smooth)
-      - push laterally (smooth)
-      - each leg finishes with short fallback tightening & settle
+    Push along a straight line with side approach:
+      - up to safety
+      - move above a PRE-CONTACT XY offset (opposite the push direction)
+      - descend to approach height
+      - slide to CONTACT, then push to GOAL (gripper stays OPEN, yaw set for pushing)
     """
-    tgt = sim.get_target_position().copy()
+    import math
 
-    if hasattr(sim, "hold_current_pose"):
-        sim.hold_current_pose(warm_steps=10)
+    tgt = sim.get_target_position().copy()
+    dvec = _dir_vec(direction)[:2]          # XY push direction
+    dvec = dvec / (np.linalg.norm(dvec) + 1e-8)
+
+    # Where to start relative to the object before pushing:
+    contact_offset = 0.06    # 6 cm behind the object's push-side
+    pre_xy    = tgt[:2] - dvec * contact_offset
+    contact_xy= tgt[:2] - dvec * 0.01       # just reach the side
+    goal_xy   = tgt[:2] + dvec * float(abs(distance))
+
+    # Set yaw so the finger bar is perpendicular to motion (flat pushing surface)
+    push_yaw = _yaw_for_push(direction)
+    if hasattr(sim, "set_yaw"):
+        sim.set_yaw(push_yaw)
+
+    # Keep gripper open for push
     if hasattr(sim, "open_gripper"):
         sim.open_gripper()
 
-    # up
+    # 1) Up to safety
     cur = sim.get_end_effector_position().copy()
     up_goal = np.array([cur[0], cur[1], max(cur[2], safety_z)], dtype=float)
     follow_segment_minjerk(sim, cur, up_goal, SEG_T_UP_S)
-    sim.set_target_position(clamp_xyz(up_goal))
-    sim.goto(clamp_xyz(up_goal), max_steps=FALLBACK_MAX_STEPS, tol=tol)
-    settle(sim)
+    sim.set_target_position(clamp_xyz(up_goal)); sim.goto(clamp_xyz(up_goal), max_steps=FALLBACK_MAX_STEPS, tol=tol); settle(sim)
 
-    # above
-    above = np.array([tgt[0], tgt[1], up_goal[2]], dtype=float)
-    follow_segment_minjerk(sim, up_goal, above, SEG_T_LATERAL_S)
-    sim.set_target_position(clamp_xyz(above))
-    sim.goto(clamp_xyz(above), max_steps=FALLBACK_MAX_STEPS, tol=tol)
-    settle(sim)
+    # 2) Above PRE-CONTACT
+    above_pre = np.array([pre_xy[0], pre_xy[1], up_goal[2]], dtype=float)
+    follow_segment_minjerk(sim, up_goal, above_pre, SEG_T_LATERAL_S)
+    sim.set_target_position(clamp_xyz(above_pre)); sim.goto(clamp_xyz(above_pre), max_steps=FALLBACK_MAX_STEPS, tol=tol); settle(sim)
 
-    # down to approach
-    down = np.array([tgt[0], tgt[1], approach_z], dtype=float)
-    follow_segment_minjerk(sim, above, down, SEG_T_DOWN_S)
-    sim.set_target_position(clamp_xyz(down))
-    sim.goto(clamp_xyz(down), max_steps=FALLBACK_MAX_STEPS, tol=tol)
-    settle(sim)
+    # 3) Down to approach height
+    pre_pt = np.array([pre_xy[0], pre_xy[1], approach_z], dtype=float)
+    follow_segment_minjerk(sim, above_pre, pre_pt, SEG_T_DOWN_S)
+    sim.set_target_position(clamp_xyz(pre_pt)); sim.goto(clamp_xyz(pre_pt), max_steps=FALLBACK_MAX_STEPS, tol=tol); settle(sim)
 
-    # push laterally
-    dx, dy = 0.0, 0.0
-    d = abs(float(distance))
-    if direction == "left":
-        dx = -d
-    elif direction == "right":
-        dx =  d
-    elif direction == "forward":
-        dy =  d
-    elif direction == "back":
-        dy = -d
-    goal = np.array([down[0] + dx, down[1] + dy, down[2]], dtype=float)
+    # 4) Slide to CONTACT (just touch the side)
+    contact_pt = np.array([contact_xy[0], contact_xy[1], approach_z], dtype=float)
+    follow_segment_minjerk(sim, pre_pt, contact_pt, 0.6)  # short approach
+    sim.set_target_position(clamp_xyz(contact_pt)); sim.goto(clamp_xyz(contact_pt), max_steps=FALLBACK_MAX_STEPS, tol=tol); settle(sim, steps=10)
 
-    follow_segment_minjerk(sim, down, goal, SEG_T_PUSH_S)
-    sim.set_target_position(clamp_xyz(goal))
-    sim.goto(clamp_xyz(goal), max_steps=FALLBACK_MAX_STEPS, tol=tol)
-    settle(sim)
+    # 5) PUSH to GOAL along direction
+    goal = np.array([goal_xy[0], goal_xy[1], approach_z], dtype=float)
+    follow_segment_minjerk(sim, contact_pt, goal, SEG_T_PUSH_S)
+    sim.set_target_position(clamp_xyz(goal)); sim.goto(clamp_xyz(goal), max_steps=FALLBACK_MAX_STEPS, tol=tol); settle(sim)
 
 # ===== Simple non-overlap object placement =====
 def _geom_footprint_radius(model, geom_id):
-    """Approximate XY footprint radius from geom type/size."""
     gtype = model.geom_type[geom_id]
     size = model.geom_size[geom_id]
-    # mjtGeom: 6=box, 4=cylinder, 0=sphere. Handle common ones; fallback ~4 cm.
     if gtype == 6:  # box
         r = float(np.linalg.norm(size[:2]))  # diagonal half-length in XY
         return max(0.03, r)

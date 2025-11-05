@@ -1,0 +1,9 @@
+CDPR Trajectory Summary
+=======================
+Trajectory: desk__orange_juice_wrapper_pick_and_hover_2025-11-05_13-41-10
+Timestamp: 2025-11-05 13:41:11
+Total frames captured: 284
+Total simulation steps: 962
+Simulation time: 16.37 seconds
+Final EE position: [0.36268816 0.36251438 0.23241174]
+Final target position: [0.40000005 0.40000034 0.3       ]

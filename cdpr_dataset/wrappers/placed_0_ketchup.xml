@@ -10,7 +10,7 @@
     <mesh file="/root/repo/LIBERO/libero/libero/assets/stable_hope_objects/ketchup/visual/textured_vis.msh" name="p0_textured_vis" scale="0.01 0.01 0.01" />
   </asset>
   <worldbody>
-    <body pos="0.5 0.5 0.15" quat="1.0 0.0 0.0 0.0">
+    <body pos="0.4 0.4 0.15" quat="1.0 0.0 0.0 0.0">
       <body name="p0_object">
         <geom solimp="0.998 0.998 0.001" solref="0.001 1" density="100" friction="0.95 0.3 0.1" type="mesh" mesh="p0_textured_vis" conaffinity="0" contype="0" group="1" material="p0_textured" />
         <geom solimp="0.998 0.998 0.001" solref="0.001 1" density="100" friction="0.95 0.3 0.1" type="box" pos="0.00045 -0.03935 0.00079" quat="0.50000 0.50000 0.50000 -0.50000" size="0.01695 0.02811 0.03307" group="0" rgba="0.8 0.8 0.8 0.3" />

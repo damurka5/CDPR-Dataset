@@ -1,0 +1,9 @@
+CDPR Trajectory Summary
+=======================
+Trajectory: desk__ketchup_wrapper_pick_and_hover_2025-11-05_13-40-35
+Timestamp: 2025-11-05 13:40:35
+Total frames captured: 284
+Total simulation steps: 962
+Simulation time: 16.37 seconds
+Final EE position: [0.36341749 0.36274909 0.23420757]
+Final target position: [0.39999992 0.39960202 0.3       ]
