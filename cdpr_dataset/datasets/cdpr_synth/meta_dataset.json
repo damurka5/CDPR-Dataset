@@ -1,54 +1,14 @@
 {
-  "num_episodes": 6,
-  "scenes": [
-    "desk",
-    "living_room_table",
-    "short_coffee_table"
-  ],
-  "tasks": [
-    "pick_and_hover",
-    "push_left"
-  ],
-  "schema": {
-    "observations": [
-      "full_image (HWC uint8)",
-      "wrist_image (HWC uint8)",
-      "state (8D normalized)"
+  "name": "cdpr_synth",
+  "format": "rlds",
+  "fields": {
+    "images": [
+      "observation/primary",
+      "observation/wrist"
     ],
-    "actions": [
-      "action/abs_7",
-      "action/delta_7"
-    ],
-    "flags": [
-      "is_first",
-      "is_last",
-      "is_terminal"
-    ],
-    "scalars": [
-      "discount",
-      "reward"
-    ],
-    "language": "language_instruction"
+    "state": "observation/state",
+    "language": "observation/task_description",
+    "action": "action"
   },
-  "bounds": {
-    "xyz": [
-      [
-        -0.8,
-        0.8
-      ],
-      [
-        -0.8,
-        0.8
-      ],
-      [
-        0.1,
-        1.2
-      ]
-    ],
-    "gripper": [
-      0.0,
-      0.06
-    ]
-  },
-  "note": "Yaw/pitch/roll follow your CDPR (only yaw used)."
+  "unnorm_key": "cdpr_synth"
 }
