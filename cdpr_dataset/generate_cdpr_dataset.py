@@ -8,6 +8,7 @@
 import os, sys, yaml, argparse, subprocess
 from pathlib import Path
 from datetime import datetime
+import math, random
 import numpy as np
 
 from cdpr_mujoco.headless_cdpr_egl import HeadlessCDPRSimulation
@@ -138,10 +139,27 @@ def build_wrapper_if_needed(scene_name: str,
         "--object_on_table",
         "--object_dynamic",
     ]
-    for obj in object_names:
-        # placeholder XY; we re-place centrally in-process
-        cmd += ["--object", f"{obj}:0.40,0.40,0.00"]
+    ROT_X_BY_OBJECT = {
+    "ketchup": math.radians(90),
+    "milk":    math.radians(90),
+    }  
 
+    for obj in object_names:
+        x = random.uniform(-0.4, 0.4)
+        y = random.uniform(-0.4, 0.4)
+        z = 0.0  # as you wanted
+
+        angle = ROT_X_BY_OBJECT.get(obj, 0.0)   # rotation about X
+        half  = angle / 2.0
+        qx = math.sin(half)
+        qy = 0.0
+        qz = 0.0
+        qw = math.cos(half)
+        cmd += [
+            "--object",
+            f"{obj}:{x:.3f},{y:.3f},{z:.3f}:{qx},{qy},{qz},{qw}"
+        ]
+        
     print(">>", " ".join(cmd))
     subprocess.run(cmd, check=True)
     print(f"✅ Built wrapper: {wrapper_out}\n   Includes {len(object_names)} object(s).")
@@ -153,51 +171,50 @@ def _episode_out_dir(wrapper_xml: Path, task_name: str) -> Path:
     return VIDEO_DIR / base
 
 def run_episode(task_name: str, wrapper_xml: Path, catalog_object_name: str):
-    """
-    Run a single scripted episode on the given wrapper scene.
-    Saves results only inside VIDEO_DIR/<unique>/...
-    """
     sim = HeadlessCDPRSimulation(xml_path=str(wrapper_xml), output_dir=str(VIDEO_DIR))
     sim.initialize()
 
-    # Ask the sim which body it considers "the object"
-    real_obj = sim.get_object_body_name()
-    if real_obj is None:
-        # ultra-fallback: our old helper, but this should normally NOT trigger
-        real_obj = _auto_detect_object_body(sim, preferred=catalog_object_name)
+    real_obj = sim.get_object_body_name() or catalog_object_name
     print(f"[run_episode] Using object body in model: {real_obj}")
 
-    # (optional) debug print non-robot bodies
-    try:
-        import mujoco as mj
-        m, d = sim.model, sim.data
-        print("[debug] Non-robot bodies present:")
-        robot_prefixes = ("rotor_", "slider_", "ee_", "camera_", "yaw_frame",
-                          "ee_platform", "finger_")
-        for bid in range(m.nbody):
-            nm = mj.mj_id2name(m, mj.mjtObj.mjOBJ_BODY, bid)
-            if not nm or nm == "world" or any(nm.startswith(p) for p in robot_prefixes):
-                continue
-            print("   ", bid, nm, "xpos=", d.xpos[bid])
-    except Exception as e:
-        print("[debug] body listing failed:", e)
-        
-    # ---- Find the actual object body in the MuJoCo model ----
-    # catalog_object_name is e.g. "ketchup", but in the wrapper the body
-    # is prefixed (e.g. "p0_ketchup"). _auto_detect_object_body handles this.
+    # CENTRAL placement window
     try:
         xy_bounds = ((-0.12, 0.12), (-0.12, 0.12), 0.10)
         place_objects_non_overlapping(sim, [real_obj], xy_bounds, min_gap=0.015)
     except Exception as e:
         print("Object placement note:", e)
 
-    # After placement, recompute geometry
+    # >>> NEW: copy model body_quat -> freejoint qpos, so orientation from wrapper is used
+    import mujoco as mj
+    import numpy as np
+
+    m, d = sim.model, sim.data
+    bid = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, real_obj)
+    if bid != -1:
+        # body_quat is [w, x, y, z] from MJCF (includes your cdpr_scene_switcher quat)
+        body_q = m.body_quat[bid].copy()
+        print(f"[debug] model.body_quat for {real_obj} = {body_q}")
+
+        jn = m.body_jntnum[bid]
+        ja = m.body_jntadr[bid]
+        for k in range(jn):
+            jid = ja + k
+            if m.jnt_type[jid] == mj.mjtJoint.mjJNT_FREE:
+                qadr = m.jnt_qposadr[jid]
+                # qpos[qadr:qadr+3] already set by place_objects_non_overlapping for position
+                d.qpos[qadr+3:qadr+7] = body_q  # copy [w,x,y,z]
+                print(f"[debug] set freejoint qpos quat for {real_obj} to {body_q}")
+                break
+
+        mj.mj_forward(m, d)
+        print(f"[debug] world xquat for {real_obj} after sync = {d.xquat[bid]}")
+
+    # Now recompute centers after orientation is applied
     cx, tz, _ = object_centers(sim, real_obj)
     ee0 = sim.get_end_effector_position().copy()
     print(f"[debug] EE0={ee0}")
     print(f"[debug] OBJ(AABB_center)=({cx[0]:.3f}, {cx[1]:.3f}, {tz:.3f})")
     print(f"[debug] dist_xy(EE0 -> OBJ_center) = {np.linalg.norm(cx - ee0[:2]):.3f} m")
-
 
     # After repositioning, recompute geometry
     cx, tz, _ = object_centers(sim, real_obj)

@@ -7,7 +7,7 @@ defaults:
 
 scenes:
   - name: desk
-    objects: [ketchup]
+    objects: [milk]
   # - name: desk
   #   objects: [orange_juice]
   # - name: desk

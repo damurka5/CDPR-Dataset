@@ -84,7 +84,7 @@
         <body name="ee_stab" pos="0 0 0">
           <inertial pos="0 0 0" mass="0.6" diaginertia="0.005 0.005 0.005" />
           <joint name="ee_ball" type="ball" damping="6" stiffness="80" armature="0.02" limited="false" />
-          <body name="camera_body" pos="0 0 -0.10">
+          <body name="camera_body" pos="0 0.05 0.07">
             <camera name="ee_camera" mode="fixed" fovy="60" />
           </body>
           <body name="ee_platform" pos="0 0 0.08">

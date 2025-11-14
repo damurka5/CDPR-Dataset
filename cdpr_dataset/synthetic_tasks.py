@@ -134,7 +134,7 @@ def _set_ee(sim, xyz):
     else:
         sim.set_target_position(x)  # fallback
 
-def follow_segment_minjerk(sim, start_xyz, goal_xyz, duration_s, capture_every_n=3):
+def follow_segment_minjerk(sim, start_xyz, goal_xyz, duration_s, capture_every_n=2):
     start = np.array(start_xyz, dtype=float)
     goal  = clamp_xyz(goal_xyz)
     dt = float(sim.controller.dt) if hasattr(sim, "controller") else 1.0/60.0
@@ -147,9 +147,9 @@ def follow_segment_minjerk(sim, start_xyz, goal_xyz, duration_s, capture_every_n
         capture = ((k % capture_every_n) == 0)
         sim.run_simulation_step(capture_frame=capture)
 
-def settle(sim, steps=SETTLE_STEPS):
+def settle(sim, steps=SETTLE_STEPS, capture=True):
     for _ in range(int(steps)):
-        sim.run_simulation_step(capture_frame=False)
+        sim.run_simulation_step(capture_frame=capture)
 
 def log_pick_diagnostics(sim, phase="pre_grasp", object_body_name="object"):
     ee = sim.get_end_effector_position().copy()
@@ -163,7 +163,7 @@ def log_pick_diagnostics(sim, phase="pre_grasp", object_body_name="object"):
 def plan_pick_waypoints(sim, target_xy, top_z,
                         safety_z=DEFAULT_SAFETY_Z,
                         clearance=0.02,      # how far above object to fly
-                        grasp_inset=0.004):  # how far into the top to “touch”
+                        grasp_inset=0.002):  # how far into the top to “touch”
     cur = sim.get_end_effector_position().copy()
     up_z = max(cur[2], safety_z, float(top_z) + float(clearance))
     w0 = clamp_xyz([cur[0],         cur[1],         up_z])
