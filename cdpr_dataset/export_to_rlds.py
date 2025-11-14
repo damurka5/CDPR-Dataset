@@ -228,7 +228,7 @@ def main():
             "std":  (A.std(axis=0) + 1e-6).tolist(),
             "min":  A.min(axis=0).tolist(),
             "max":  A.max(axis=0).tolist(),
-            "description": "Δ[x,y,z,roll,pitch,yaw,gripper] for CDPR synthetic dataset"
+            "description": "Δ[x,y,z,yaw,gripper] for CDPR synthetic dataset"
         }
         with open(STATS_PATH, "w") as f:
             json.dump(stats, f, indent=2)

@@ -15,6 +15,8 @@ from cdpr_mujoco.headless_cdpr_egl import HeadlessCDPRSimulation
 from .synthetic_tasks import (
     script_pick_and_hover,
     script_push,
+    script_move_to_xy,
+    object_centers,
     place_objects_non_overlapping,
 )
 
@@ -54,6 +56,60 @@ def load_catalog(catalog_path: str):
 def _wrapper_name(scene: str, object_names: list[str]) -> str:
     objs = "-".join(sorted(object_names))
     return f"{scene}__{objs}_wrapper.xml"
+
+def _auto_detect_object_body(sim, preferred: str | None = None) -> str:
+    import mujoco as mj
+    m = sim.model
+
+    def has_body(name: str) -> bool:
+        return mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, name) != -1
+
+    # 1) preferred exact match (just in case the wrapper kept the raw name)
+    if preferred and has_body(preferred):
+        return preferred
+
+    # 2) common wrapper names
+    for candidate in ("object", "target_object"):
+        if has_body(candidate):
+            return candidate
+
+    # 3) heuristic: prefer placed LIBERO objects (prefix p0_, p1_, ...)
+    robot_prefixes = ("rotor_", "slider_", "ee_", "camera_", "yaw_frame", "ee_platform", "finger_")
+
+    placed_candidates = []
+    free_candidates   = []
+
+    for bid in range(m.nbody):
+        name = mj.mj_id2name(m, mj.mjtObj.mjOBJ_BODY, bid)
+        if not name or name == "world":
+            continue
+        if any(name.startswith(pfx) for pfx in robot_prefixes):
+            continue
+
+        jn = m.body_jntnum[bid]
+        ja = m.body_jntadr[bid]
+        has_free = any(m.jnt_type[ja + k] == mj.mjtJoint.mjJNT_FREE for k in range(jn))
+
+        if has_free:
+            free_candidates.append(name)
+            if name.startswith("p0_") or name.startswith("p1_"):
+                placed_candidates.append(name)
+
+    if placed_candidates:
+        return placed_candidates[0]
+    if free_candidates:
+        return free_candidates[0]
+
+    # fallback: helpful error
+    sample = []
+    for i in range(m.nbody):
+        nm = mj.mj_id2name(m, mj.mjtObj.mjOBJ_BODY, i)
+        if nm:
+            sample.append(nm)
+    raise RuntimeError(
+        "Could not auto-detect object body. "
+        f"Available bodies: {', '.join(sample[:30])}{' ...' if len(sample) > 30 else ''}"
+    )
 
 def build_wrapper_if_needed(scene_name: str,
                             object_names: list[str],
@@ -96,7 +152,7 @@ def _episode_out_dir(wrapper_xml: Path, task_name: str) -> Path:
     base = f"{Path(wrapper_xml).stem}_{task_name}_{stamp}"
     return VIDEO_DIR / base
 
-def run_episode(task_name: str, wrapper_xml: Path):
+def run_episode(task_name: str, wrapper_xml: Path, catalog_object_name: str):
     """
     Run a single scripted episode on the given wrapper scene.
     Saves results only inside VIDEO_DIR/<unique>/...
@@ -104,21 +160,71 @@ def run_episode(task_name: str, wrapper_xml: Path):
     sim = HeadlessCDPRSimulation(xml_path=str(wrapper_xml), output_dir=str(VIDEO_DIR))
     sim.initialize()
 
-    # CENTRAL placement window: near (0,0) to encourage solid picks/pushes
+    # Ask the sim which body it considers "the object"
+    real_obj = sim.get_object_body_name()
+    if real_obj is None:
+        # ultra-fallback: our old helper, but this should normally NOT trigger
+        real_obj = _auto_detect_object_body(sim, preferred=catalog_object_name)
+    print(f"[run_episode] Using object body in model: {real_obj}")
+
+    # (optional) debug print non-robot bodies
     try:
-        # tight ROI around origin (±12 cm); adjust if your table/objects need more space
+        import mujoco as mj
+        m, d = sim.model, sim.data
+        print("[debug] Non-robot bodies present:")
+        robot_prefixes = ("rotor_", "slider_", "ee_", "camera_", "yaw_frame",
+                          "ee_platform", "finger_")
+        for bid in range(m.nbody):
+            nm = mj.mj_id2name(m, mj.mjtObj.mjOBJ_BODY, bid)
+            if not nm or nm == "world" or any(nm.startswith(p) for p in robot_prefixes):
+                continue
+            print("   ", bid, nm, "xpos=", d.xpos[bid])
+    except Exception as e:
+        print("[debug] body listing failed:", e)
+        
+    # ---- Find the actual object body in the MuJoCo model ----
+    # catalog_object_name is e.g. "ketchup", but in the wrapper the body
+    # is prefixed (e.g. "p0_ketchup"). _auto_detect_object_body handles this.
+    try:
         xy_bounds = ((-0.12, 0.12), (-0.12, 0.12), 0.10)
-        place_objects_non_overlapping(sim, ["target_object"], xy_bounds, min_gap=0.015)
+        place_objects_non_overlapping(sim, [real_obj], xy_bounds, min_gap=0.015)
     except Exception as e:
         print("Object placement note:", e)
 
+    # After placement, recompute geometry
+    cx, tz, _ = object_centers(sim, real_obj)
+    ee0 = sim.get_end_effector_position().copy()
+    print(f"[debug] EE0={ee0}")
+    print(f"[debug] OBJ(AABB_center)=({cx[0]:.3f}, {cx[1]:.3f}, {tz:.3f})")
+    print(f"[debug] dist_xy(EE0 -> OBJ_center) = {np.linalg.norm(cx - ee0[:2]):.3f} m")
+
+
+    # After repositioning, recompute geometry
+    cx, tz, _ = object_centers(sim, real_obj)
+
+    # For comparison: MuJoCo body_xpos of that same body
+    try:
+        import mujoco as mj
+        m, d = sim.model, sim.data
+        bid = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, real_obj)
+        body_pos = d.body_xpos[bid].copy()
+    except Exception:
+        body_pos = None
+
+    # ---- Run the desired scripted task ----
     if task_name == "pick_and_hover":
-        script_pick_and_hover(sim, tol=0.03)
+        script_pick_and_hover(sim, object_body_name=real_obj, tol=0.015)
     elif "push" in task_name:
-        # "left", "right", "forward", "back" inferred from name
-        direction = "left" if "left" in task_name else ("right" if "right" in task_name
-                    else ("forward" if "forward" in task_name else "back"))
-        script_push(sim, direction=direction, tol=0.03)
+        direction = (
+            "left" if "left" in task_name else
+            "right" if "right" in task_name else
+            "forward" if "forward" in task_name else
+            "back"
+        )
+        script_push(sim, object_body_name=real_obj, direction=direction, tol=0.015)
+    elif task_name == "move_to_center":
+        goal_xy = (0.0, 0.0)
+        script_move_to_xy(sim, object_body_name=real_obj, goal_xy=goal_xy, tol=0.015)
     else:
         raise ValueError(f"Unknown task: {task_name}")
 
@@ -126,6 +232,7 @@ def run_episode(task_name: str, wrapper_xml: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
     sim.save_trajectory_results(str(out_dir), f"{out_dir.name}")
     sim.cleanup()
+
 
 def main():
     args = parse_args()
@@ -160,9 +267,13 @@ def main():
                                               table_z=table_z,
                                               settle_time=settle_t)
         print(f"✅ Loaded scene '{scene_name}' with {len(object_names)} object(s). Wrapper at: {wrapper_xml}")
+        # Choose the (single) object name from your catalog; default to the first.
+        obj_body = object_names[0] if object_names else "target_object"
         for _ in range(args.episodes_per_scene):
             for t in args.tasks:
-                run_episode(t, wrapper_xml)
+                print(f"Using catalog object name: {obj_body}")
+                run_episode(t, wrapper_xml, obj_body)
+
 
 if __name__ == "__main__":
     main()

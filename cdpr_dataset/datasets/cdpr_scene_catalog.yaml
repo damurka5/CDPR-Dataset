@@ -8,12 +8,12 @@ defaults:
 scenes:
   - name: desk
     objects: [ketchup]
-  - name: desk
-    objects: [orange_juice]
-  - name: desk
-    objects: [milk]
-  - name: desk
-    objects: [cookies]
+  # - name: desk
+  #   objects: [orange_juice]
+  # - name: desk
+  #   objects: [milk]
+  # - name: desk
+  #   objects: [cookies]
   # - name: living_room_table
   #   objects: [milk]
   # - name: short_coffee_table
