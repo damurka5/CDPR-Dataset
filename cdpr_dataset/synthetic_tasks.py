@@ -11,15 +11,15 @@ XYZ_BOUNDS = {
 GRIP_RANGE = (0.0, 0.03)
 
 # Tolerances / heights
-DEFAULT_TOL = 0.015         # 1.5 cm tolerance
+DEFAULT_TOL = 0.01         # 1.5 cm tolerance
 DEFAULT_SAFETY_Z = 0.35    # "up" height before moving laterally
 DEFAULT_GRASP_Z = 0.06     # approach height for picking
 DEFAULT_LIFT_Z  = 0.30     # lift height after grasp
 
 # Timing for smooth segments (in seconds)
-SEG_T_UP_S      = 1.5
-SEG_T_LATERAL_S = 2.0
-SEG_T_DOWN_S    = 1.2
+SEG_T_UP_S      = 1.0 # was 1.5
+SEG_T_LATERAL_S = 1.2 # was 2.0 
+SEG_T_DOWN_S    = 0.5 # was 1.2  
 SEG_T_PUSH_S    = 2.0
 SETTLE_STEPS = 20
 FALLBACK_MAX_STEPS = 120
@@ -37,6 +37,20 @@ def clamp_xyz(xyz):
 def minjerk(u: float) -> float:
     u = float(max(0.0, min(1.0, u)))
     return u**3 * (10 - 15*u + 6*u*u)
+
+def _goto_if_available(sim, target_xyz, tol=DEFAULT_TOL):
+    target = clamp_xyz(target_xyz)
+    # seed whichever API exists
+    if hasattr(sim, "set_end_effector_target"):
+        sim.set_end_effector_target(target)
+    elif hasattr(sim, "set_ee_target"):
+        sim.set_ee_target(target)
+    elif hasattr(sim, "set_target_position"):
+        sim.set_target_position(target)
+    # refine using feedback
+    if hasattr(sim, "goto"):
+        sim.goto(target, max_steps=FALLBACK_MAX_STEPS, tol=tol)
+    settle(sim, 10)
 
 def aabb_of_body(sim, body_name, include_subtree=True):
     """
@@ -117,6 +131,28 @@ def aabb_of_body(sim, body_name, include_subtree=True):
 
     return xyz_min, xyz_max
 
+def resolve_body_name(sim, logical_name: str) -> str:
+    """
+    Resolve a logical body name to an actual MuJoCo body name.
+    - First tries exact match.
+    - Then falls back to substring search (useful for prefixed LIBERO objects like 'p0_red_bowl').
+    """
+    import mujoco as mj
+    m = sim.model
+
+    # exact match
+    bid = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, logical_name)
+    if bid != -1:
+        return logical_name
+
+    # substring fallback
+    for i in range(m.nbody):
+        nm = mj.mj_id2name(m, mj.mjtObj.mjOBJ_BODY, i)
+        if nm and logical_name in nm:
+            return nm
+
+    raise ValueError(f"Could not resolve body name for '{logical_name}'.")
+
 def object_centers(sim, body_name="target_object"):
     mn, mx = aabb_of_body(sim, body_name, include_subtree=True)
     center_xy = np.array([(mn[0]+mx[0])*0.5, (mn[1]+mx[1])*0.5], dtype=float)
@@ -171,6 +207,34 @@ def plan_pick_waypoints(sim, target_xy, top_z,
     w2 = clamp_xyz([target_xy[0],   target_xy[1],   float(top_z) + float(grasp_inset)])
     return [w0, w1, w2]
 
+def task_language(task_name: str, object_name: str) -> str:
+    """
+    Map internal task_name + catalog object_name to a natural language instruction.
+    object_name should be the catalog name (e.g., 'milk', 'ketchup').
+    """
+    nice_obj = object_name.replace("_", " ")
+
+    if task_name == "pick_and_hover":
+        return f"pick up the {nice_obj} and hover above the table"
+
+    if task_name == "move_to_center":
+        return f"pick up the {nice_obj} and move it to the center of the table"
+
+    if task_name == "push_left":
+        return f"push the {nice_obj} to the left"
+    if task_name == "push_right":
+        return f"push the {nice_obj} to the right"
+    if task_name == "push_forward":
+        return f"push the {nice_obj} forward"
+    if task_name == "push_back":
+        return f"push the {nice_obj} back"
+
+    if task_name == "put_into_bowl":
+        # return f"put the {nice_obj} into the bowl"
+        return f"put the {nice_obj} on the plate"
+
+    # fallback: at least something
+    return f"do the {task_name} task with the {nice_obj}"
     
 def script_pick_and_hover(sim,
                           object_body_name="object",
@@ -193,14 +257,22 @@ def script_pick_and_hover(sim,
                                     target_xy=center_xy,
                                     top_z=top_z,
                                     safety_z=safety_z,
-                                    clearance=0.015,
-                                    grasp_inset=0.004)
+                                    clearance=0.00,
+                                    grasp_inset=0.002)
 
     # Execute (single min-jerk per leg; no duplicate goto)
     cur = sim.get_end_effector_position().copy()
-    follow_segment_minjerk(sim, cur,           waypoints[0], SEG_T_UP_S);       settle(sim, 10)
-    follow_segment_minjerk(sim, waypoints[0],  waypoints[1], SEG_T_LATERAL_S);  settle(sim, 10)
-    follow_segment_minjerk(sim, waypoints[1],  waypoints[2], SEG_T_DOWN_S);     settle(sim, 15)
+    # Up
+    follow_segment_minjerk(sim, cur, waypoints[0], SEG_T_UP_S)
+    _goto_if_available(sim, waypoints[0], tol=tol)
+
+    # Lateral
+    follow_segment_minjerk(sim, waypoints[0], waypoints[1], SEG_T_LATERAL_S)
+    _goto_if_available(sim, waypoints[1], tol=tol)
+
+    # Down
+    follow_segment_minjerk(sim, waypoints[1], waypoints[2], SEG_T_DOWN_S)
+    _goto_if_available(sim, waypoints[2], tol=tol)
 
     log_pick_diagnostics(sim, phase="pre_grasp", object_body_name=object_body_name)
 
@@ -212,7 +284,8 @@ def script_pick_and_hover(sim,
     # Lift to a safe height above both safety & object
     lift_goal = clamp_xyz([center_xy[0], center_xy[1], max(lift_z, safety_z, top_z + 0.10)])
     follow_segment_minjerk(sim, sim.get_end_effector_position().copy(), lift_goal, SEG_T_UP_S);  settle(sim, 10)
-
+    _goto_if_available(sim, lift_goal, tol=tol)
+        
     log_pick_diagnostics(sim, phase="post_lift", object_body_name=object_body_name)
 
 
@@ -320,7 +393,7 @@ def script_move_to_xy(sim,
                           tol=0.01,  # stricter than default
                           safety_z=safety_z,
                           grasp_z=top_z + 0.004,
-                          lift_z=max(safety_z, top_z + 0.20))
+                          lift_z=max(safety_z, top_z))
 
     # 3) Move above goal
     above_goal = np.array([goal_xy[0], goal_xy[1], max(safety_z, top_z + 0.20)], dtype=float)
@@ -330,7 +403,7 @@ def script_move_to_xy(sim,
 
     # 4) Place: descend to slightly above table then release
     table_z = getattr(sim, "table_z", 0.15)  # if your sim exposes it; else hardcode
-    place_z = table_z + 0.01  # 1 cm above table; tune
+    place_z = table_z + 0.05  # 1 cm above table; tune
     down_pt = np.array([goal_xy[0], goal_xy[1], place_z], dtype=float)
     follow_segment_minjerk(sim, above_goal, down_pt, SEG_T_DOWN_S)
     sim.set_target_position(clamp_xyz(down_pt)); sim.goto(clamp_xyz(down_pt), max_steps=FALLBACK_MAX_STEPS, tol=0.008); settle(sim, steps=20)
@@ -343,6 +416,63 @@ def script_move_to_xy(sim,
     follow_segment_minjerk(sim, down_pt, up, SEG_T_UP_S)
     sim.set_target_position(clamp_xyz(up)); sim.goto(clamp_xyz(up), max_steps=FALLBACK_MAX_STEPS, tol=tol); settle(sim)
 
+def script_put_into_bowl(sim,
+                         object_body_name="object",
+                         bowl_body_name="plate", # change to plate, was "red_bowl"
+                         safety_z=DEFAULT_SAFETY_Z,
+                         tol=DEFAULT_TOL):
+    """
+    1) Pick up the object.
+    2) Move above the bowl.
+    3) Lower into / just above the bowl interior.
+    4) Open gripper and retract.
+    object_body_name and bowl_body_name can be logical names; we resolve
+    them to actual MuJoCo body names (e.g., 'p0_red_bowl').
+    """
+    # Resolve actual body names (handles prefixes like p0_, p1_, etc.)
+    obj_body  = resolve_body_name(sim, object_body_name)
+    bowl_body = resolve_body_name(sim, bowl_body_name)
+
+    # 1) Pick the object and hover at a safe height
+    script_pick_and_hover(sim,
+                          object_body_name=obj_body,
+                          tol=tol,
+                          safety_z=safety_z,
+                          lift_z=max(DEFAULT_LIFT_Z, safety_z))
+
+    # 2) Get bowl pose
+    bowl_xy, bowl_top_z, bowl_center_z = object_centers(sim, bowl_body)
+
+    # Move above the bowl
+    cur = sim.get_end_effector_position().copy()
+    above_z = max(safety_z, bowl_top_z + 0.15)
+    above_bowl = np.array([bowl_xy[0], bowl_xy[1], above_z], dtype=float)
+
+    follow_segment_minjerk(sim, cur, above_bowl, SEG_T_LATERAL_S)
+    _goto_if_available(sim, above_bowl, tol=tol)
+
+    # 3) Descend into / just above bowl
+    # Heuristic: place slightly above bowl center or table, whichever is higher.
+    table_z = getattr(sim, "table_z", 0.15)
+    place_z = max(table_z + 0.02, bowl_center_z)
+    # Don't go above bowl_top_z + 1cm, or we risk dropping on the rim
+    place_z = min(place_z, bowl_top_z + 0.01)
+    place_z += 0.10
+
+    drop_pt = np.array([bowl_xy[0], bowl_xy[1], place_z], dtype=float)
+    follow_segment_minjerk(sim, above_bowl, drop_pt, SEG_T_DOWN_S)
+    _goto_if_available(sim, drop_pt, tol=tol)
+
+    # Open gripper to drop object into the bowl
+    if hasattr(sim, "open_gripper"):
+        sim.open_gripper()
+    settle(sim, steps=10)
+
+    # 4) Retract upwards
+    retract = np.array([bowl_xy[0], bowl_xy[1], above_z], dtype=float)
+    follow_segment_minjerk(sim, drop_pt, retract, SEG_T_UP_S)
+    _goto_if_available(sim, retract, tol=tol)
+    settle(sim, steps=10)
 
 # ===== Simple non-overlap object placement =====
 def _geom_footprint_radius(model, geom_id):
@@ -358,7 +488,8 @@ def _geom_footprint_radius(model, geom_id):
 
 def place_objects_non_overlapping(sim, object_body_names, xy_bounds, min_gap=0.02, max_tries=200):
     """
-    Randomly place objects by setting their body pose XY at a fixed Z, avoiding XY overlap.
+    Randomly place objects by setting their body pose XY at a fixed Z, avoiding XY overlap
+    and avoiding spawning under the end-effector.
     - xy_bounds = ((xmin, xmax), (ymin, ymax), fixed_z)
     - Uses each body's first geom footprint to estimate radius.
     For single-object episodes, just pass ['target_object'].
@@ -366,6 +497,19 @@ def place_objects_non_overlapping(sim, object_body_names, xy_bounds, min_gap=0.0
     import mujoco as mj
     model, data = sim.model, sim.data
     xmin, xmax = xy_bounds[0]; ymin, ymax = xy_bounds[1]; z_fixed = xy_bounds[2]
+
+    # ---- NEW: avoid placing objects too close to the current EE XY ----
+    MIN_EE_DIST = 0.05  # 5 cm
+
+    if hasattr(sim, "get_end_effector_position"):
+        ee = sim.get_end_effector_position().copy()
+        ee_x, ee_y = float(ee[0]), float(ee[1])
+    else:
+        # fallback: assume EE at origin if we can't query it
+        ee_x, ee_y = 0.0, 0.0
+
+    def far_from_ee(x, y, min_dist=MIN_EE_DIST):
+        return (x - ee_x) ** 2 + (y - ee_y) ** 2 >= (min_dist ** 2)
 
     placed = []
     for name in object_body_names:
@@ -375,10 +519,19 @@ def place_objects_non_overlapping(sim, object_body_names, xy_bounds, min_gap=0.0
         if len(geom_ids) > 0:
             r = _geom_footprint_radius(model, int(geom_ids[0]))
         ok = False
+
         for _ in range(max_tries):
             x = random.uniform(xmin + r, xmax - r)
             y = random.uniform(ymin + r, ymax - r)
-            if all((x - px)**2 + (y - py)**2 >= (r + pr + min_gap)**2 for (px, py, pr) in placed):
+
+            # NEW: skip positions too close to EE
+            if not far_from_ee(x, y):
+                continue
+
+            # Existing non-overlap condition with already placed objects
+            if all((x - px)**2 + (y - py)**2 >= (r + pr + min_gap)**2
+                   for (px, py, pr) in placed):
+
                 # Try free joint first (typical for movable objects)
                 j = model.body_jntnum[bid]
                 jadr = model.body_jntadr[bid]
@@ -393,10 +546,13 @@ def place_objects_non_overlapping(sim, object_body_names, xy_bounds, min_gap=0.0
                 if not free_found:
                     # fallback: move kinematic body via xpos (rare for LIBERO objects)
                     data.xpos[bid] = np.array([x, y, z_fixed], dtype=float)
+
                 placed.append((x, y, r))
                 ok = True
                 break
+
         if not ok:
             raise RuntimeError(f"Could not place object '{name}' without overlap in {max_tries} tries.")
+
     mj.mj_forward(model, data)
     return [(px, py) for (px, py, _) in placed]

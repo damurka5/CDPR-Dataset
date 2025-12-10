@@ -17,8 +17,10 @@ from .synthetic_tasks import (
     script_pick_and_hover,
     script_push,
     script_move_to_xy,
+    script_put_into_bowl,
     object_centers,
     place_objects_non_overlapping,
+    task_language
 )
 
 # ----- I/O roots (never write into VLA_CDPR) -----
@@ -140,14 +142,112 @@ def build_wrapper_if_needed(scene_name: str,
         "--object_dynamic",
     ]
     ROT_X_BY_OBJECT = {
-    "ketchup": math.radians(90),
-    "milk":    math.radians(90),
+        "ketchup":      math.radians(90),
+        "milk":         math.radians(90),
+        "tomato_sauce": math.radians(90),
     }  
 
+    # ---------- NEW: placement logic with "avoid gripper" constraint ----------
+    # ee_start is a function argument: (x, y, z)
+    ee_x, ee_y = float(ee_start[0]), float(ee_start[1])
+    MIN_EE_DIST = 0.05  # 5 cm in XY
+
+    def far_from_ee(x, y, min_dist=MIN_EE_DIST):
+        return (x - ee_x) ** 2 + (y - ee_y) ** 2 >= (min_dist ** 2)
+
+    placements = {}  # obj_name -> (x, y, z)
+
+    has_bowl = any(obj == "red_bowl" or "plate" in obj for obj in object_names) # change back to "bowl"
+    # treat the first non-bowl as the "main" object
+    main_objects = [obj for obj in object_names if not ("bowl" in obj)]
+
+    # 1) Place non-bowl objects near the center, but not under the gripper
+    for obj in main_objects:
+        max_tries = 100
+        placed = False
+        for _ in range(max_tries):
+            x = random.uniform(-0.25, 0.25)
+            y = random.uniform(-0.25, 0.25)
+            if far_from_ee(x, y):
+                placements[obj] = (x, y, 0.0)
+                placed = True
+                break
+        if not placed:
+            # last resort: place somewhere in workspace but still away from EE
+            while True:
+                x = random.uniform(-0.4, 0.4)
+                y = random.uniform(-0.4, 0.4)
+                if far_from_ee(x, y):
+                    placements[obj] = (x, y, 0.0)
+                    break
+
+    # 2) Place bowl(s) offset from the first main object, not under EE
+    if has_bowl:
+        # choose which name we treat as bowl – red_bowl, white_bowl, etc.
+        bowl_names = [obj for obj in object_names if "plate" in obj] # change back to "bowl"
+        # if LIBERO asset is 'red_bowl', that's what you'll have here
+        for bowl_name in bowl_names:
+            if main_objects:
+                anchor = main_objects[0]
+                ax, ay, _ = placements.get(anchor, (0.0, 0.0, 0.0))
+                r_min, r_max = 0.18, 0.28  # 18–28 cm away from anchor
+                max_tries = 100
+                placed = False
+                for _ in range(max_tries):
+                    r = random.uniform(r_min, r_max)
+                    theta = random.uniform(0.0, 2.0 * math.pi)
+                    bx = ax + r * math.cos(theta)
+                    by = ay + r * math.sin(theta)
+                    # keep inside workspace and away from EE
+                    if -0.4 <= bx <= 0.4 and -0.4 <= by <= 0.4 and far_from_ee(bx, by):
+                        placements[bowl_name] = (bx, by, 0.0)
+                        placed = True
+                        break
+                if not placed:
+                    # fallback: random, but away from EE
+                    while True:
+                        bx = random.uniform(-0.35, 0.35)
+                        by = random.uniform(-0.35, 0.35)
+                        if far_from_ee(bx, by):
+                            placements[bowl_name] = (bx, by, 0.0)
+                            break
+            else:
+                # bowl only: place centrally but away from EE
+                max_tries = 100
+                placed = False
+                for _ in range(max_tries):
+                    bx = random.uniform(-0.25, 0.25)
+                    by = random.uniform(-0.25, 0.25)
+                    if far_from_ee(bx, by):
+                        placements[bowl_name] = (bx, by, 0.0)
+                        placed = True
+                        break
+                if not placed:
+                    while True:
+                        bx = random.uniform(-0.35, 0.35)
+                        by = random.uniform(-0.35, 0.35)
+                        if far_from_ee(bx, by):
+                            placements[bowl_name] = (bx, by, 0.0)
+                            break
+
+    # 3) Build CLI --object flags from placements
     for obj in object_names:
-        x = random.uniform(-0.4, 0.4)
-        y = random.uniform(-0.4, 0.4)
-        z = 0.0  # as you wanted
+        # default random placement if somehow not in placements dict, still respecting EE
+        if obj not in placements:
+            max_tries = 100
+            placed = False
+            for _ in range(max_tries):
+                x = random.uniform(-0.4, 0.4)
+                y = random.uniform(-0.4, 0.4)
+                if far_from_ee(x, y):
+                    placements[obj] = (x, y, 0.0)
+                    placed = True
+                    break
+            if not placed:
+                # absolute last resort: ignore constraint
+                placements[obj] = (0.0, 0.0, 0.0)
+
+        x, y, z = placements[obj]
 
         angle = ROT_X_BY_OBJECT.get(obj, 0.0)   # rotation about X
         half  = angle / 2.0
@@ -228,9 +328,10 @@ def run_episode(task_name: str, wrapper_xml: Path, catalog_object_name: str):
     except Exception:
         body_pos = None
 
-    # ---- Run the desired scripted task ----
+        # ---- Run the desired scripted task ----
     if task_name == "pick_and_hover":
         script_pick_and_hover(sim, object_body_name=real_obj, tol=0.015)
+
     elif "push" in task_name:
         direction = (
             "left" if "left" in task_name else
@@ -239,13 +340,32 @@ def run_episode(task_name: str, wrapper_xml: Path, catalog_object_name: str):
             "back"
         )
         script_push(sim, object_body_name=real_obj, direction=direction, tol=0.015)
+
     elif task_name == "move_to_center":
         goal_xy = (0.0, 0.0)
         script_move_to_xy(sim, object_body_name=real_obj, goal_xy=goal_xy, tol=0.015)
+
+    elif task_name == "put_into_bowl":
+        # here real_obj is the placed LIBERO body name of your object
+        # and the bowl is 'red_bowl' (it will be resolved inside the script)
+        from .synthetic_tasks import script_put_into_bowl  # or add to the import block above
+        script_put_into_bowl(
+            sim,
+            object_body_name=catalog_object_name,   # use actual body name
+            bowl_body_name="plate", # change back to "red_bowl"
+            tol=0.015,
+        )
+
     else:
         raise ValueError(f"Unknown task: {task_name}")
 
-    out_dir = _episode_out_dir(wrapper_xml, task_name)
+    # ---- Attach natural language prompt for this episode ----
+    # catalog_object_name is what you passed into run_episode (e.g. 'milk')
+    language = task_language(task_name, catalog_object_name)
+    # store on the sim so save_summary can write it out
+    setattr(sim, "language_instruction", language)
+
+    out_dir = _episode_out_dir(wrapper_xml, "put_on_plate") # change back to task_name
     out_dir.mkdir(parents=True, exist_ok=True)
     sim.save_trajectory_results(str(out_dir), f"{out_dir.name}")
     sim.cleanup()
@@ -274,10 +394,13 @@ def main():
 
     for scene_name, object_names, defaults in scene_specs:
         scene_z   = defaults.get("scene_z", -0.85)
-        ee_start  = tuple(defaults.get("ee_start", (0.0, 0.0, 0.25)))
+        ee_start  = list(defaults.get("ee_start", (0.0, 0.0, 0.45)))
         table_z   = defaults.get("table_z", 0.15)
         settle_t  = defaults.get("settle_time", 1.0)
+        # if any("bowl" in obj for obj in object_names):
+        #     ee_start[2] = max(ee_start[2], 0.35)   # raise to at least 0.35 m
 
+        # ee_start = tuple(ee_start)
         wrapper_xml = build_wrapper_if_needed(scene_name, object_names,
                                               scene_z=scene_z,
                                               ee_start=ee_start,

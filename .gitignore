@@ -16,6 +16,8 @@ lib64/
 parts/
 sdist/
 var/
+cdpr_dataset/datasets/cdpr_synth/libero_spatial_no_noops/
+cdpr_dataset/datasets/cdpr_synth/videos/
 *.egg-info/
 .installed.cfg
 *.egg
