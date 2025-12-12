@@ -51,7 +51,7 @@ def ensure_dirs():
 
 def episode_out_dir(wrapper_xml: Path, task_name: str) -> Path:
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    base = f"{wrapper_xml.stem}_{task_name}_{stamp}"
+    base = f"HUMAN_CONTROL_{wrapper_xml.stem}_{task_name}_{stamp}"
     return VIDEO_DIR / base
 
 
