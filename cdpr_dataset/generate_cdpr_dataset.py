@@ -260,10 +260,26 @@ def build_wrapper_if_needed(scene_name: str,
             f"{obj}:{x:.3f},{y:.3f},{z:.3f}:{qx},{qy},{qz},{qw}"
         ]
         
+    # subprocess.run(cmd, check=True)
     print(">>", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    proc = subprocess.run(cmd)  # NOTE: no check=True
+
+    if proc.returncode != 0:
+        # On macOS, cdpr_scene_switcher may segfault after writing wrapper XML.
+        # If the wrapper exists, we can safely continue.
+        if wrapper_out.exists() and wrapper_out.stat().st_size > 0:
+            print(
+                f"⚠️ cdpr_scene_switcher exited with code {proc.returncode}, "
+                f"but wrapper was created. Continuing with: {wrapper_out}"
+            )
+        else:
+            raise RuntimeError(
+                f"cdpr_scene_switcher failed (code {proc.returncode}) and wrapper was not created."
+            )
+
     print(f"✅ Built wrapper: {wrapper_out}\n   Includes {len(object_names)} object(s).")
     return wrapper_out
+
 
 def _episode_out_dir(wrapper_xml: Path, task_name: str) -> Path:
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

@@ -50,3 +50,9 @@ coverage.xml
 
 # Sphinx documentation
 docs/_build/
+
+# MuJoCo / CDPR generated wrappers (machine-specific)
+cdpr_dataset/wrappers/*.xml
+
+# Generated datasets / videos
+cdpr_dataset/datasets/cdpr_synth/
