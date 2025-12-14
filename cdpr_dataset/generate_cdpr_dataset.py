@@ -144,7 +144,9 @@ def build_wrapper_if_needed(scene_name: str,
     ROT_X_BY_OBJECT = {
         "ketchup":      math.radians(90),
         "milk":         math.radians(90),
+        "orange_juice": math.radians(90),
         "tomato_sauce": math.radians(90),
+        "ycb_wood_block": math.radians(90),
     }  
 
     # ---------- NEW: placement logic with "avoid gripper" constraint ----------

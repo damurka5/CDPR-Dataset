@@ -56,3 +56,4 @@ cdpr_dataset/wrappers/*.xml
 
 # Generated datasets / videos
 cdpr_dataset/datasets/cdpr_synth/
+external_assets/

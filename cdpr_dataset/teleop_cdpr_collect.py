@@ -22,6 +22,7 @@ Output:
 
 import argparse
 import math
+import mujoco as mj
 import re
 import time
 from pathlib import Path
@@ -258,7 +259,8 @@ def teleop_episode(sim,
         step += 1
 
         if step % int(hz * 2) == 0:
-            print(f"step={step} ee={ee} yaw={yaw:.2f}")
+            print(f"step={step} ee={ee} yaw_cmd={yaw:.2f} yaw_qpos={sim.get_yaw():.2f} ctrl={sim.data.ctrl[sim.act_yaw]:.2f}")
+
 
     listener.stop()
     cv2.destroyAllWindows()
@@ -380,6 +382,7 @@ def main():
 
             sim = HeadlessCDPRSimulation(xml_path=str(wrapper_to_use), output_dir=str(out_dir))
             sim.initialize()
+            
             try:
                 teleop_episode(
                     sim,
