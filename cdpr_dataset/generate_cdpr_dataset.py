@@ -409,7 +409,7 @@ def main():
         if args.scene is None or args.object is None:
             raise SystemExit("Provide --catalog or both --scene and --object.")
         scene_specs.append((args.scene, [args.object], {}))
-
+    
     for scene_name, object_names, defaults in scene_specs:
         scene_z   = defaults.get("scene_z", -0.85)
         ee_start  = list(defaults.get("ee_start", (0.0, 0.0, 0.45)))
