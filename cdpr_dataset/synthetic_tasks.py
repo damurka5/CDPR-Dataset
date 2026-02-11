@@ -231,7 +231,7 @@ def task_language(task_name: str, object_name: str) -> str:
 
     if task_name == "put_into_bowl":
         # return f"put the {nice_obj} into the bowl"
-        return f"put the {nice_obj} on the plate"
+        return f"put {nice_obj} on plate"
 
     # fallback: at least something
     return f"do the {task_name} task with the {nice_obj}"

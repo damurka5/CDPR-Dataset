@@ -7,7 +7,7 @@ defaults:
 
 scenes:
   - name: desk
-    objects: [ycb_plate, ycb_cracker_box]
+    objects: [ycb_apple]
   # - name: desk
   #   objects: [orange_juice]
   # - name: desk
