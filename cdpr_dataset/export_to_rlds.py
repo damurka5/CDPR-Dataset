@@ -2,14 +2,20 @@
 """
 Convert CDPR HUMAN_CONTROL episodes into RLDS TFRecords compatible with OpenVLA-OFT's LIBERO loaders.
 
-Writes:
-- One TFRecord per episode folder
-- meta_dataset.json (updated)
-- action_stats_<DATASET_NAME>.json
+This version fixes camera/log alignment issues by:
+  - Using the log trajectory length (timestamps/target_position/control_signals) as the canonical episode length.
+  - Resampling EACH camera stream independently to that length.
+  - Sampling frames across the FULL video span (start->end), i.e. "keep full video but skip frames",
+    instead of relying on (often-wrong) FPS metadata.
 
-Assumptions:
-- Each episode dir has: overview_video.mp4, ee_camera_video.mp4, trajectory_data.npz
-- summary.txt contains 'language_instruction: ...' (optional but preferred)
+It also writes per-step timestamps (seconds since episode start) into the TFRecord as:
+  observation/timestamp
+
+Assumptions per episode directory:
+  - overview_video.mp4
+  - ee_camera_video.mp4
+  - trajectory_data.npz
+  - (optional) summary.txt with "language_instruction: ..."
 """
 
 import os, json, re
@@ -22,10 +28,8 @@ from tqdm import tqdm
 HERE = Path(__file__).resolve().parent
 DATASET_ROOT = "/root/repo/cdpr_synth_10hz/"
 
-# === CHANGE: read from HUMAN_CONTROL instead of videos ===
 VIDEO_ROOT = Path(DATASET_ROOT + "videos/")
 
-# Keep same structure requested by OpenVLA-OFT / LIBERO-style
 DATASET_NAME = "libero_spatial_no_noops/"
 TFREC_DIR   = Path(DATASET_ROOT + DATASET_NAME + "tfrecords_human_control_fixed")
 META_PATH   = DATASET_ROOT + "meta_dataset.json"
@@ -34,21 +38,18 @@ STATS_PATH  = DATASET_ROOT + f"action_stats_{DATASET_NAME}.json"
 
 # ---------------- Helpers ----------------
 
-def _find(arrs, candidates):
-    for k in candidates:
-        if k in arrs:
-            return k
-    return None
-
-def _img_bytes(arr):
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR),
-                           [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+def _img_bytes(arr_rgb: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(
+        ".jpg",
+        cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2BGR),
+        [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+    )
     return buf.tobytes() if ok else b""
 
-def _npz_keys(npz):
+def _npz_keys(npz) -> list[str]:
     return [k for k in npz.files]
 
-def _read_video_frames(path: Path, desc: str = ""):
+def _read_video_frames(path: Path, desc: str = "") -> list[np.ndarray]:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {path}")
@@ -71,14 +72,6 @@ def _read_video_frames(path: Path, desc: str = ""):
         raise RuntimeError(f"Decoded 0 frames from {path}")
     return frames
 
-
-def _delta(a: np.ndarray):
-    if len(a) < 2:
-        return np.zeros_like(a)
-    da = np.zeros_like(a)
-    da[1:] = a[1:] - a[:-1]
-    return da
-
 def _read_language_from_summary(summary_path: Path):
     if not summary_path.exists():
         return None
@@ -90,43 +83,61 @@ def _read_language_from_summary(summary_path: Path):
         pass
     return None
 
-def _fallback_language_from_folder(ep_dir: Path):
-    # Your old folder parsing fallback, kept in case summary.txt missing
+def _fallback_language_from_folder(ep_dir: Path) -> str:
     m = re.match(r"(?P<prefix>[^_]+)_(?P<scene>[^_]+)__", ep_dir.name)
     if m:
         scene = m.group("scene").replace("-", " ")
         return f"perform the task on the {scene}."
     return "perform the task"
 
-def pick_log_indices_for_video(timestamps, video_fps, num_frames=None, start_time=None):
-    ts = np.asarray(timestamps, dtype=np.float64)
-    if ts.ndim != 1 or len(ts) < 2:
-        raise ValueError("timestamps must be 1D and length>=2")
+def _normalize_timestamps_to_seconds(ts: np.ndarray) -> np.ndarray:
+    """
+    Heuristic unit normalization: timestamps can be in s/ms/us/ns.
+    Returns seconds.
+    """
+    ts = np.asarray(ts, dtype=np.float64).reshape(-1)
+    if ts.size < 2:
+        return ts
 
-    t0 = ts[0] if start_time is None else float(start_time)
+    dt0 = float(np.median(np.diff(ts)))
+    candidates = []
+    for scale in (1.0, 1e3, 1e6, 1e9):
+        dt = dt0 / scale
+        if 1e-4 <= dt <= 1.0:
+            score = abs(np.log(dt) - np.log(0.1))  # mild preference for ~10Hz
+            candidates.append((score, scale))
+    scale = min(candidates, key=lambda x: x[0])[1] if candidates else 1.0
+    return ts / scale
 
-    if num_frames is None:
-        t_end = ts[-1]
-        num_frames = int(np.floor((t_end - t0) * float(video_fps))) + 1
-        num_frames = max(1, num_frames)
+def pick_video_indices_fullspan(ts_seconds: np.ndarray, num_video_frames: int) -> np.ndarray:
+    """
+    Map each log timestamp to a video frame index by normalized progress through the episode.
 
-    frame_times = t0 + np.arange(int(num_frames), dtype=np.float64) / float(video_fps)
+    This *does not* rely on FPS metadata. It guarantees we spread indices across the full
+    [0 .. num_video_frames-1] range (i.e., "full video but skipped frames").
+    """
+    ts = np.asarray(ts_seconds, dtype=np.float64).reshape(-1)
+    if ts.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+    if num_video_frames <= 0:
+        raise ValueError("num_video_frames must be > 0")
+    if num_video_frames == 1:
+        return np.zeros((ts.size,), dtype=np.int64)
 
-    idx = np.searchsorted(ts, frame_times, side="left")
-    idx = np.clip(idx, 0, len(ts) - 1)
+    t0 = float(ts[0])
+    t1 = float(ts[-1])
+    dur = t1 - t0
 
-    prev = np.clip(idx - 1, 0, len(ts) - 1)
-    choose_prev = np.abs(ts[prev] - frame_times) < np.abs(ts[idx] - frame_times)
-    idx = np.where(choose_prev, prev, idx)
+    if dur <= 1e-12:
+        # Degenerate timestamps -> uniform index ramp
+        p = np.linspace(0.0, 1.0, ts.size, dtype=np.float64)
+    else:
+        p = (ts - t0) / dur
+        p = np.clip(p, 0.0, 1.0)
 
-    return idx.astype(np.int64)
-
-
-def _video_fps(path: Path, fallback=10.0):
-    cap = cv2.VideoCapture(str(path))
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    cap.release()
-    return fps if fps > 1e-3 else float(fallback)
+    idx = np.rint(p * (num_video_frames - 1)).astype(np.int64)
+    idx = np.clip(idx, 0, num_video_frames - 1)
+    return idx
 
 def _episode_to_rlds(ep_dir: Path):
     ov_path = ep_dir / "overview_video.mp4"
@@ -137,107 +148,99 @@ def _episode_to_rlds(ep_dir: Path):
     if not (ov_path.exists() and ee_path.exists() and npz_path.exists()):
         raise FileNotFoundError(f"Missing files in {ep_dir}")
 
-    ov_frames = _read_video_frames(ov_path, desc=f"read overview {ep_dir.name}")
-    ee_frames = _read_video_frames(ee_path, desc=f"read wrist {ep_dir.name}")
+    # Decode videos
+    ov_all = _read_video_frames(ov_path, desc=f"read overview {ep_dir.name}")
+    ee_all = _read_video_frames(ee_path, desc=f"read wrist {ep_dir.name}")
 
     logs = np.load(npz_path, allow_pickle=True)
     keys = _npz_keys(logs)
-    
-    # 1) Determine fps and number of frames
-    
-    # fps = 10.0  # since this is cdpr_synth_10hz
-    # M = len(ov_frames)
-    
 
-    # 2) Build indices mapping each video frame time -> nearest log index
-    ts = np.asarray(logs["timestamp"], dtype=np.float64)
+    for req in ("timestamp", "target_position", "control_signals"):
+        if req not in logs:
+            raise KeyError(f"Missing '{req}' in {npz_path}. Available keys: {keys}")
 
-    # --- Align video frames to log duration ---
-    fps = _video_fps(ov_path, fallback=10.0)
-    M_vid = min(len(ov_frames), len(ee_frames))  # common video length
+    ts_raw = np.asarray(logs["timestamp"])
+    ts = _normalize_timestamps_to_seconds(ts_raw)
+
+    xyz_all = np.asarray(logs["target_position"], dtype=np.float32)
+    ctrl_all = np.asarray(logs["control_signals"], dtype=np.float32)
+
+    # Canonical length from logs
+    N = int(min(len(ts), len(xyz_all), len(ctrl_all)))
+    if N < 2:
+        raise ValueError(f"Episode too short after alignment: N={N}")
+
+    ts = ts[:N]
+    xyz = xyz_all[:N]
+    ctrl = ctrl_all[:N]
+
+    ts_rel = (ts - ts[0]).astype(np.float32)
+
+    median_dt = float(np.median(np.diff(ts))) if N >= 2 else 0.0
+    hz = (1.0 / median_dt) if median_dt > 1e-12 else float("nan")
     log_dur = float(ts[-1] - ts[0])
-    M_log = int(np.floor(log_dur * fps)) + 1  # max frames covered by logs at 'fps'
-    M = min(M_vid, M_log)
 
-    if M < M_vid:
-        print(f"[warn] {ep_dir.name}: video longer than logs -> truncating video frames "
-              f"{M_vid} -> {M} (video_dur={M_vid/fps:.3f}s, log_dur={log_dur:.3f}s, fps={fps:.3f})")
+    print(f"logs: N={N}, duration={log_dur:.3f}s, median_dt={median_dt:.4f}s (~{hz:.2f}Hz)")
+    print(f"videos: overview frames={len(ov_all)} | wrist frames={len(ee_all)}")
 
-    ov_frames = ov_frames[:M]
-    ee_frames = ee_frames[:M]
+    # --- Resample videos across their full span to match N ---
+    ov_idx = pick_video_indices_fullspan(ts, num_video_frames=len(ov_all))
+    ee_idx = pick_video_indices_fullspan(ts, num_video_frames=len(ee_all))
 
-    # Map each kept video frame time to nearest log index
-    idx = pick_log_indices_for_video(ts, fps, num_frames=M)
-    tail_repeat = int(np.sum(idx == idx[-1]))
-    if tail_repeat > 1:
-        print(f"[warn] {ep_dir.name}: last log index repeated for {tail_repeat} frames "
-              f"(likely still some post-roll frames).")
+    # Materialize resampled frames
+    ov_frames = [ov_all[i] for i in ov_idx]
+    ee_frames = [ee_all[i] for i in ee_idx]
 
-    # 3) Slice logs using idx so they align to video frames
-    xyz = np.asarray(logs["target_position"], dtype=np.float32)[idx]   # (M,3)
+    # --- Build state + delta-action from logs (5D: x,y,z,yaw,grip) ---
+    if ctrl.ndim != 2 or ctrl.shape[1] < 2:
+        raise ValueError(f"control_signals has unexpected shape: {ctrl.shape}")
 
-    ctrl = np.asarray(logs["control_signals"], dtype=np.float32)       # (N,nu)
-    yaw = ctrl[idx, -2]   # better: exact actuator index if you load xml
-    gr  = ctrl[idx, -1]   # gripper opening [0..0.03]
+    yaw = ctrl[:, -2]
+    gr  = ctrl[:, -1]
 
-    # 5D absolute state [x,y,z,yaw,grip]
-    abs5 = np.zeros((M,5), np.float32)
-    abs5[:,0:3] = xyz
-    abs5[:,3] = yaw
-    abs5[:,4] = gr
+    abs5 = np.zeros((N, 5), np.float32)
+    abs5[:, 0:3] = xyz
+    abs5[:, 3] = yaw
+    abs5[:, 4] = gr
 
     act = np.zeros_like(abs5)
     act[:-1] = abs5[1:] - abs5[:-1]
-    # wrap yaw delta to [-pi, pi]
     dy = act[:-1, 3]
     act[:-1, 3] = (dy + np.pi) % (2*np.pi) - np.pi
     act[-1] = 0
 
-    print("action min/max:", act.min(axis=0), act.max(axis=0))
-    print("gripper changes:", (np.abs(np.diff(abs5[:,4])) > 1e-6).sum())
-    print("gripper abs min/max:", abs5[:,4].min(), abs5[:,4].max())
-
-
-    # Training target: delta action
-    # act = _delta(abs5)
-
-    # Trim to common length
-    state     = abs5.astype(np.float32)
-
-    # Prefer summary.txt language instruction
     lang = _read_language_from_summary(summary_path) or _fallback_language_from_folder(ep_dir)
 
     steps = []
-    T = min(len(ov_frames), len(ee_frames), len(act))
-    for t in range(T):
+    for t in range(N):
         steps.append({
             "observation": {
                 "full_image": ov_frames[t],
                 "wrist_image": ee_frames[t],
-                "state": state[t],
+                "state": abs5[t],
+                "timestamp": float(ts_rel[t]),  # seconds since episode start
                 "task_description": lang,
             },
             "action": act[t],
-            "is_terminal": (t == T - 1),
+            "is_terminal": (t == N - 1),
             "is_first": (t == 0),
-            "is_last": (t == T - 1),
+            "is_last": (t == N - 1),
         })
+
     return steps, act
+
 
 def _serialize_step(step):
     def _bytes_feature(b): return tf.train.Feature(bytes_list=tf.train.BytesList(value=[b]))
     def _float_feature(v): return tf.train.Feature(float_list=tf.train.FloatList(value=v))
     def _int_feature(v):   return tf.train.Feature(int64_list=tf.train.Int64List(value=v))
 
-    def _png_bytes(arr):
-        ok, buf = cv2.imencode(".png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
-        return buf.tobytes() if ok else b""
-
     obs = step["observation"]
     features = {
         "observation/primary": _bytes_feature(_img_bytes(obs["full_image"])),
         "observation/wrist":   _bytes_feature(_img_bytes(obs["wrist_image"])),
         "observation/state": _float_feature(obs["state"].astype(np.float32).tolist()),
+        "observation/timestamp": _float_feature([float(obs["timestamp"])]),
         "observation/task_description": _bytes_feature(obs["task_description"].encode("utf-8")),
         "action": _float_feature(step["action"].astype(np.float32).tolist()),
         "is_terminal": _int_feature([int(step["is_terminal"])]),
@@ -266,7 +269,6 @@ def main():
             print(f"[skip] {ep.name}: {e}")
             continue
 
-        # === CHANGE: one TFRecord per episode ===
         tfrec_path = TFREC_DIR / f"libero_spatial_no_noops-train-{ep.name}.tfrecord"
         with tf.io.TFRecordWriter(str(tfrec_path)) as w:
             for st in steps:
@@ -274,28 +276,13 @@ def main():
 
         all_actions.append(act)
 
-    # Stats across all steps
-    # if all_actions:
-    #     A = np.concatenate(all_actions, axis=0)
-    #     stats = {
-    #         "key": "cdpr_human_control",
-    #         "dim": A.shape[1],
-    #         "mean": A.mean(axis=0).tolist(),
-    #         "std":  (A.std(axis=0) + 1e-6).tolist(),
-    #         "min":  A.min(axis=0).tolist(),
-    #         "max":  A.max(axis=0).tolist(),
-    #         "description": "Δ[x,y,z,yaw,gripper] for CDPR HUMAN_CONTROL dataset"
-    #     }
-    #     with open(STATS_PATH, "w") as f:
-    #         json.dump(stats, f, indent=2)
-    #     print(f"✅ Wrote action stats → {STATS_PATH}")
-
     meta = {
         "name": "cdpr_human_control",
         "format": "rlds",
         "fields": {
             "images": ["observation/primary", "observation/wrist"],
             "state":  "observation/state",
+            "timestamp": "observation/timestamp",
             "language": "observation/task_description",
             "action": "action",
         },
