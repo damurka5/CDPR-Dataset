@@ -155,14 +155,14 @@ def _episode_to_rlds(ep_dir: Path):
     logs = np.load(npz_path, allow_pickle=True)
     keys = _npz_keys(logs)
 
-    for req in ("timestamp", "target_position", "control_signals"):
+    for req in ("timestamp", "ee_position", "control_signals"):
         if req not in logs:
             raise KeyError(f"Missing '{req}' in {npz_path}. Available keys: {keys}")
 
     ts_raw = np.asarray(logs["timestamp"])
     ts = _normalize_timestamps_to_seconds(ts_raw)
 
-    xyz_all = np.asarray(logs["target_position"], dtype=np.float32)
+    xyz_all = np.asarray(logs["ee_position"], dtype=np.float32)
     ctrl_all = np.asarray(logs["control_signals"], dtype=np.float32)
 
     # Canonical length from logs
