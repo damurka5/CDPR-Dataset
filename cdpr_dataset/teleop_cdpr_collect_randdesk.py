@@ -47,7 +47,7 @@ from .synthetic_tasks import clamp_xyz, task_language
 
 
 HERE = Path(__file__).resolve().parent
-DATASET_ROOT = HERE / "datasets" / "cdpr_synth"
+DATASET_ROOT = HERE / "datasets" / "cdpr_synth_pick"
 VIDEO_DIR = DATASET_ROOT / "videos"
 WRAP_DIR = HERE / "wrappers"
 
@@ -61,7 +61,7 @@ def ensure_dirs():
 
 def episode_out_dir(wrapper_xml: Path, task_name: str, tex_tag: str) -> Path:
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    base = f"HUMAN_CONTROL_{wrapper_xml.stem}_{task_name}_{tex_tag}_{stamp}"
+    base = f"HUMAN_CONTROL_{stamp}_{wrapper_xml.stem}_{task_name}_{tex_tag}"
     return VIDEO_DIR / base
 
 
@@ -263,7 +263,55 @@ def _patch_one_xml_file(
 
     return matched
 
+import numpy as np
+import cv2
+from pathlib import Path
 
+def make_tiled_texture(
+    src: Path,
+    dst: Path,
+    tiles_x: int,
+    tiles_y: int,
+    max_tex_size: int = 8192,          # try 8192 or 16384
+    min_px_per_tile: int = 256,        # increase to 512 for extra sharpness
+):
+    img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(f"Could not read texture: {src}")
+
+    h, w = img.shape[:2]
+
+    # 1) If the tile is *too big* to fit repeats under max_tex_size, downscale the tile (sharply).
+    #    Compute the largest tile size that fits.
+    max_tile_w = max(1, max_tex_size // tiles_x)
+    max_tile_h = max(1, max_tex_size // tiles_y)
+
+    # Keep aspect ratio
+    scale = min(1.0, max_tile_w / w, max_tile_h / h)
+
+    # 2) Also ensure each tile has at least min_px_per_tile (if possible under max_tex_size).
+    #    If min_px_per_tile would exceed max_tex_size, it will be capped by max_tile_w/h above.
+    desired_scale = max(min_px_per_tile / w, min_px_per_tile / h)
+    scale = min(1.0, max(scale, min(desired_scale, 1.0)))
+
+    if scale < 1.0:
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        # Sharper than INTER_AREA for “keep it crisp”
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        h, w = img.shape[:2]
+
+    # 3) Tile (this step is lossless)
+    if img.ndim == 3:
+        tiled = np.tile(img, (tiles_y, tiles_x, 1))
+    else:
+        tiled = np.tile(img, (tiles_y, tiles_x))
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    ok = cv2.imwrite(str(dst), tiled)
+    if not ok:
+        raise RuntimeError(f"Could not write tiled texture: {dst}")
+    
 def make_textured_wrapper(
     base_wrapper_xml: Path,
     texture_png: Path,
@@ -284,8 +332,11 @@ def make_textured_wrapper(
     tex_dir = WRAP_DIR / "_desk_textures"
     tex_dir.mkdir(parents=True, exist_ok=True)
     copied_tex = tex_dir / f"{variant_tag}__{texture_png.name}"
+    # if (not copied_tex.exists()) or force:
+        # shutil.copy2(texture_png, copied_tex)
+    copied_tex = tex_dir / f"{variant_tag}__tiled_{texrepeat_xy[0]}x{texrepeat_xy[1]}__{texture_png.stem}.png"
     if (not copied_tex.exists()) or force:
-        shutil.copy2(texture_png, copied_tex)
+        make_tiled_texture(texture_png, copied_tex, texrepeat_xy[0], texrepeat_xy[1])
 
     # Names must be unique per variant to avoid collisions
     desk_tex_name = f"desktex_{variant_tag}"
@@ -319,6 +370,30 @@ def make_textured_wrapper(
     # Use relative path from wrapper to copied texture
     tex_file_attr = _relpath_or_abs(copied_tex, wrapper_copy.parent)
 
+    # --- texture ---
+    tex_el = None
+    for el in asset.findall("texture"):
+        if el.get("name") == desk_tex_name:
+            tex_el = el
+            break
+    if tex_el is None:
+        tex_el = ET.SubElement(asset, "texture", {"name": desk_tex_name, "type": "2d"})
+    tex_el.set("file", tex_file_attr)
+
+    # --- material ---
+    mat_el = None
+    for el in asset.findall("material"):
+        if el.get("name") == desk_mat_name:
+            mat_el = el
+            break
+    if mat_el is None:
+        mat_el = ET.SubElement(asset, "material", {"name": desk_mat_name})
+
+    mat_el.set("texture", desk_tex_name)
+    # mat_el.set("texrepeat", f"{texrepeat_xy[0]} {texrepeat_xy[1]}")
+    # mat_el.set("texuniform", "false")   # or "true" if you actually want repeats-per-meter
+    mat_el.set("texrepeat", "1 1")
+    mat_el.set("texuniform", "false")
     # If re-running, avoid duplicating tags
     def _has_asset(tag, name):
         for el in asset.findall(tag):
@@ -338,7 +413,7 @@ def make_textured_wrapper(
             "name": desk_mat_name,
             "texture": desk_tex_name,
             "texrepeat": f"{texrepeat_xy[0]} {texrepeat_xy[1]}",
-            "texuniform": "true",
+            "texuniform": "false",
         })
 
     tree.write(wrapper_copy, encoding="utf-8", xml_declaration=True)
@@ -604,7 +679,7 @@ def parse_args():
                     help="Total number of desk-texture variants per teleop recording (including the teleop one).")
     ap.add_argument("--desk_geom_regex", type=str, default=r"(table|desk|workbench|counter|surface)",
                     help="Regex used to decide which geoms/materials are 'the desk/table'.")
-    ap.add_argument("--desk_texrepeat", type=int, nargs=2, default=(4, 4),
+    ap.add_argument("--desk_texrepeat", type=int, nargs=2, default=(20, 20),
                     help="Material texrepeat X Y for the desk texture tiling.")
     ap.add_argument("--seed", type=int, default=0,
                     help="Random seed for picking textures (0 means use time-based seed).")
