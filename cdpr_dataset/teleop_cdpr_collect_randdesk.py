@@ -26,6 +26,7 @@ or with your catalog:
 
 import argparse
 import math
+import os
 import random
 import re
 import shutil
@@ -50,6 +51,7 @@ HERE = Path(__file__).resolve().parent
 DATASET_ROOT = HERE / "datasets" / "cdpr_synth_pick"
 VIDEO_DIR = DATASET_ROOT / "videos"
 WRAP_DIR = HERE / "wrappers"
+DEFAULT_ALLOWED_OBJECTS = ("ycb_apple", "ycb_pear", "ycb_peach")
 
 
 # ---------------- I/O ----------------
@@ -630,6 +632,29 @@ def replay_episode(
 
 # ---------------- CLI ----------------
 
+def _safe_unlink(path: Path):
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _cleanup_generated_wrappers(created_paths: list[Path], variant_tags: list[str]):
+    to_remove = {p.resolve() for p in created_paths if p is not None}
+    tex_dir = WRAP_DIR / "_desk_textures"
+
+    for tag in variant_tags:
+        for xml_path in WRAP_DIR.rglob(f"*__desktex_{tag}.xml"):
+            to_remove.add(xml_path.resolve())
+        if tex_dir.exists():
+            for tex_path in tex_dir.glob(f"{tag}__*"):
+                to_remove.add(tex_path.resolve())
+
+    for p in sorted(to_remove):
+        _safe_unlink(p)
+
+
 def load_catalog(catalog_path: str):
     import yaml
     with open(catalog_path, "r") as f:
@@ -655,6 +680,13 @@ def parse_args():
     ap.add_argument("--catalog", type=str, default=None)
     ap.add_argument("--scene", type=str, default=None)
     ap.add_argument("--object", type=str, default=None)
+    ap.add_argument(
+        "--allowed_objects",
+        type=str,
+        nargs="*",
+        default=list(DEFAULT_ALLOWED_OBJECTS),
+        help="Only use/track these object names from the catalog.",
+    )
 
     ap.add_argument("--episodes", type=int, default=1,
                     help="How many base teleop recordings to do (each base recording gets desk_augments variants).")
@@ -685,6 +717,11 @@ def parse_args():
                     help="Random seed for picking textures (0 means use time-based seed).")
     ap.add_argument("--force_regen_textured_wrappers", action="store_true",
                     help="Re-generate textured wrapper XML copies even if they already exist.")
+    ap.add_argument(
+        "--keep_wrappers",
+        action="store_true",
+        help="Keep generated temporary wrappers/textured copies instead of deleting them.",
+    )
     ap.add_argument(
                     "--desk_textures",
                     type=str,
@@ -732,7 +769,18 @@ def main():
             raise SystemExit("Provide --catalog or both --scene and --object.")
         scene_specs.append((args.scene, [args.object], {}))
 
+    allowed_objects = {str(x) for x in args.allowed_objects}
+    if not allowed_objects:
+        raise SystemExit("--allowed_objects cannot be empty.")
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
     for scene_name, object_names, defaults in scene_specs:
+        object_names = [str(x) for x in object_names if str(x) in allowed_objects]
+        if not object_names:
+            print(f"⏭️ Skipping scene '{scene_name}': none of its objects are in --allowed_objects.")
+            continue
+
         scene_z = defaults.get("scene_z", -0.85)
         ee_start = list(defaults.get("ee_start", (0.0, 0.0, 0.45)))
         table_z = defaults.get("table_z", 0.15)
@@ -747,107 +795,128 @@ def main():
                 except Exception as e:
                     print(f"Could not remove {p}: {e}")
 
-        # Choose wrapper
-        if args.wrapper_xml:
-            wrapper_xml = Path(args.wrapper_xml).expanduser().resolve()
-            if not wrapper_xml.exists():
-                raise SystemExit(f"--wrapper_xml not found: {wrapper_xml}")
-        else:
-            wrapper_xml = build_wrapper_if_needed(
-                scene_name,
-                object_names,
-                scene_z=scene_z,
-                ee_start=ee_start,
-                table_z=table_z,
-                settle_time=settle_t,
-            )
-
-        wrapper_base = patch_wrapper_includes(wrapper_xml, WRAP_DIR) if args.patch_wrapper_paths else wrapper_xml
-        print(f"✅ Scene '{scene_name}' wrapper: {wrapper_base}")
-
         obj_name = object_names[0] if object_names else "object"
         language = args.language if args.language else task_language(args.task_name, obj_name)
 
         for epi in range(args.episodes):
             print(f"\n=== Teleop recording {epi+1}/{args.episodes}: scene={scene_name} obj={obj_name} ===")
+            created_paths: list[Path] = []
+            variant_tags: list[str] = []
 
-            # choose textures
-            k = int(args.desk_augments)
-            if k <= 0:
-                raise SystemExit("--desk_augments must be >= 1")
-
-            if args.desk_textures and len(args.desk_textures) > 0:
-                chosen = []
-                for t in args.desk_textures:
-                    p = Path(t).expanduser()
-                    if not p.is_absolute():
-                        p = (textures_dir / p).resolve()
-                    if not p.exists():
-                        raise SystemExit(f"Texture not found: {p}")
-                    chosen.append(p)
-                if len(chosen) != k:
-                    raise SystemExit(f"--desk_textures count ({len(chosen)}) must equal --desk_augments ({k})")
-            else:
-                if k <= len(texture_files):
-                    chosen = random.sample(texture_files, k)
-                else:
-                    chosen = [random.choice(texture_files) for _ in range(k)]
-
-            # build textured wrappers
-            wrapper_variants = []
-            for vi, tex in enumerate(chosen):
-                tag = f"epi{epi+1}_v{vi+1}_{tex.stem}"
-                res = make_textured_wrapper(
-                    wrapper_base,
-                    tex,
-                    variant_tag=tag,
-                    table_geom_regex=args.desk_geom_regex,
-                    texrepeat_xy=tuple(args.desk_texrepeat),
-                    force=args.force_regen_textured_wrappers,
-                )
-                wrapper_variants.append((res.wrapper_xml, tex, tag, res.matched_geoms))
-                print(f"  🎨 variant {vi+1}/{k}: {tex.name} -> {res.wrapper_xml.name} (matched_geoms={res.matched_geoms})")
-
-            # --- 1) Teleop ONCE on the first variant ---
-            wrapper0, tex0, tag0, _ = wrapper_variants[0]
-            out0 = episode_out_dir(wrapper0, "teleop", tex_tag=tex0.stem)
-            out0.mkdir(parents=True, exist_ok=True)
-            (out0 / "desk_texture.txt").write_text(str(tex0), encoding="utf-8")
-
-            sim0 = HeadlessCDPRSimulation(xml_path=str(wrapper0), output_dir=str(out0))
-            sim0.initialize()
             try:
-                commands = teleop_episode_record(
-                    sim0,
-                    language_instruction=language,
-                    out_dir=out0,
-                    translational_step=args.trans_step,
-                    z_step=args.z_step,
-                    yaw_step_deg=args.yaw_step_deg,
-                    hz=args.hz,
-                    show_preview=True,
-                )
-            finally:
-                sim0.cleanup()
+                if args.wrapper_xml:
+                    src_wrapper_xml = Path(args.wrapper_xml).expanduser().resolve()
+                    if not src_wrapper_xml.exists():
+                        raise SystemExit(f"--wrapper_xml not found: {src_wrapper_xml}")
+                    wrapper_xml = WRAP_DIR / f"{src_wrapper_xml.stem}__teleopsrc_{int(time.time_ns())}.xml"
+                    shutil.copy2(src_wrapper_xml, wrapper_xml)
+                    created_paths.append(wrapper_xml)
+                else:
+                    wrapper_out = WRAP_DIR / (
+                        f"{scene_name}__{'-'.join(sorted(object_names))}__teleoptmp_{int(time.time_ns())}.xml"
+                    )
+                    wrapper_xml = build_wrapper_if_needed(
+                        scene_name,
+                        object_names,
+                        scene_z=scene_z,
+                        ee_start=ee_start,
+                        table_z=table_z,
+                        settle_time=settle_t,
+                        wrapper_out=wrapper_out,
+                        use_cache=False,
+                    )
+                    created_paths.append(wrapper_xml)
 
-            # --- 2) Replay the same commands on remaining variants ---
-            for wrapper_i, tex_i, tag_i, _ in wrapper_variants[1:]:
-                out_i = episode_out_dir(wrapper_i, "replay", tex_tag=tex_i.stem)
-                out_i.mkdir(parents=True, exist_ok=True)
-                (out_i / "desk_texture.txt").write_text(str(tex_i), encoding="utf-8")
+                wrapper_base = patch_wrapper_includes(wrapper_xml, WRAP_DIR) if args.patch_wrapper_paths else wrapper_xml
+                if wrapper_base != wrapper_xml:
+                    created_paths.append(wrapper_base)
+                print(f"✅ Scene '{scene_name}' wrapper: {wrapper_base}")
 
-                sim_i = HeadlessCDPRSimulation(xml_path=str(wrapper_i), output_dir=str(out_i))
-                sim_i.initialize()
+                # choose textures
+                k = int(args.desk_augments)
+                if k <= 0:
+                    raise SystemExit("--desk_augments must be >= 1")
+
+                if args.desk_textures and len(args.desk_textures) > 0:
+                    chosen = []
+                    for t in args.desk_textures:
+                        p = Path(t).expanduser()
+                        if not p.is_absolute():
+                            p = (textures_dir / p).resolve()
+                        if not p.exists():
+                            raise SystemExit(f"Texture not found: {p}")
+                        chosen.append(p)
+                    if len(chosen) != k:
+                        raise SystemExit(f"--desk_textures count ({len(chosen)}) must equal --desk_augments ({k})")
+                else:
+                    if k <= len(texture_files):
+                        chosen = random.sample(texture_files, k)
+                    else:
+                        chosen = [random.choice(texture_files) for _ in range(k)]
+
+                # build textured wrappers
+                wrapper_variants = []
+                for vi, tex in enumerate(chosen):
+                    tag = f"{run_id}_epi{epi+1}_v{vi+1}_{tex.stem}"
+                    variant_tags.append(tag)
+                    res = make_textured_wrapper(
+                        wrapper_base,
+                        tex,
+                        variant_tag=tag,
+                        table_geom_regex=args.desk_geom_regex,
+                        texrepeat_xy=tuple(args.desk_texrepeat),
+                        force=args.force_regen_textured_wrappers,
+                    )
+                    wrapper_variants.append((res.wrapper_xml, tex, tag, res.matched_geoms))
+                    created_paths.append(res.wrapper_xml)
+                    print(
+                        f"  🎨 variant {vi+1}/{k}: {tex.name} -> {res.wrapper_xml.name} "
+                        f"(matched_geoms={res.matched_geoms})"
+                    )
+
+                # --- 1) Teleop ONCE on the first variant ---
+                wrapper0, tex0, tag0, _ = wrapper_variants[0]
+                out0 = episode_out_dir(wrapper0, "teleop", tex_tag=tex0.stem)
+                out0.mkdir(parents=True, exist_ok=True)
+                (out0 / "desk_texture.txt").write_text(str(tex0), encoding="utf-8")
+
+                sim0 = HeadlessCDPRSimulation(xml_path=str(wrapper0), output_dir=str(out0))
+                sim0.initialize()
                 try:
-                    replay_episode(
-                        sim_i,
-                        commands=commands,
+                    commands = teleop_episode_record(
+                        sim0,
                         language_instruction=language,
-                        out_dir=out_i,
-                        show_preview=False,
+                        out_dir=out0,
+                        translational_step=args.trans_step,
+                        z_step=args.z_step,
+                        yaw_step_deg=args.yaw_step_deg,
+                        hz=args.hz,
+                        show_preview=True,
                     )
                 finally:
-                    sim_i.cleanup()
+                    sim0.cleanup()
+
+                # --- 2) Replay the same commands on remaining variants ---
+                for wrapper_i, tex_i, tag_i, _ in wrapper_variants[1:]:
+                    out_i = episode_out_dir(wrapper_i, "replay", tex_tag=tex_i.stem)
+                    out_i.mkdir(parents=True, exist_ok=True)
+                    (out_i / "desk_texture.txt").write_text(str(tex_i), encoding="utf-8")
+
+                    sim_i = HeadlessCDPRSimulation(xml_path=str(wrapper_i), output_dir=str(out_i))
+                    sim_i.initialize()
+                    try:
+                        replay_episode(
+                            sim_i,
+                            commands=commands,
+                            language_instruction=language,
+                            out_dir=out_i,
+                            show_preview=False,
+                        )
+                    finally:
+                        sim_i.cleanup()
+            finally:
+                if not args.keep_wrappers:
+                    _cleanup_generated_wrappers(created_paths, variant_tags)
 
 
 if __name__ == "__main__":

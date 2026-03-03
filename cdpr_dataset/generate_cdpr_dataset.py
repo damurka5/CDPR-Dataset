@@ -119,16 +119,34 @@ def build_wrapper_if_needed(scene_name: str,
                             scene_z=-0.85,
                             ee_start=(0.0, 0.0, 0.25),
                             table_z=0.15,
-                            settle_time=1.0) -> Path:
+                            settle_time=1.0,
+                            wrapper_out: str | Path | None = None,
+                            use_cache: bool = True) -> Path:
     """
-    Compose a wrapper XML into our WRAP_DIR using the scene-switcher CLI.
-    We cache per (scene, objects) combo; subsequent runs reuse that wrapper.
+    Compose a wrapper XML into WRAP_DIR (or explicit wrapper_out) using the
+    scene-switcher CLI.
+
+    Default behavior keeps a cache per (scene, objects) combo. For RL runs that
+    need per-episode randomization and cleanup, pass use_cache=False and a unique
+    wrapper_out path inside the dataset repo.
     """
     WRAP_DIR.mkdir(parents=True, exist_ok=True)
-    wrapper_out = WRAP_DIR / _wrapper_name(scene_name, object_names)
-    if wrapper_out.exists():
-        print(f"✅ Using cached wrapper: {wrapper_out}")
-        return wrapper_out
+    if wrapper_out is None:
+        wrapper_path = WRAP_DIR / _wrapper_name(scene_name, object_names)
+    else:
+        wrapper_path = Path(wrapper_out).expanduser().resolve()
+        wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if use_cache and wrapper_path.exists():
+        print(f"✅ Using cached wrapper: {wrapper_path}")
+        return wrapper_path
+
+    if (not use_cache) and wrapper_path.exists():
+        try:
+            wrapper_path.unlink()
+        except Exception:
+            # Continue and let scene switcher attempt to overwrite.
+            pass
 
     cmd = [
         sys.executable, "-m", "cdpr_mujoco.cdpr_scene_switcher",
@@ -137,7 +155,7 @@ def build_wrapper_if_needed(scene_name: str,
         "--ee_start", ",".join(map(str, ee_start)),
         "--table_z", str(table_z),
         "--settle_time", str(settle_time),
-        "--wrapper_out", str(wrapper_out),
+        "--wrapper_out", str(wrapper_path),
         "--object_on_table",
         "--object_dynamic",
     ]
@@ -269,18 +287,18 @@ def build_wrapper_if_needed(scene_name: str,
     if proc.returncode != 0:
         # On macOS, cdpr_scene_switcher may segfault after writing wrapper XML.
         # If the wrapper exists, we can safely continue.
-        if wrapper_out.exists() and wrapper_out.stat().st_size > 0:
+        if wrapper_path.exists() and wrapper_path.stat().st_size > 0:
             print(
                 f"⚠️ cdpr_scene_switcher exited with code {proc.returncode}, "
-                f"but wrapper was created. Continuing with: {wrapper_out}"
+                f"but wrapper was created. Continuing with: {wrapper_path}"
             )
         else:
             raise RuntimeError(
                 f"cdpr_scene_switcher failed (code {proc.returncode}) and wrapper was not created."
             )
 
-    print(f"✅ Built wrapper: {wrapper_out}\n   Includes {len(object_names)} object(s).")
-    return wrapper_out
+    print(f"✅ Built wrapper: {wrapper_path}\n   Includes {len(object_names)} object(s).")
+    return wrapper_path
 
 
 def _episode_out_dir(wrapper_xml: Path, task_name: str) -> Path:
