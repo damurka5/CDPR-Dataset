@@ -526,11 +526,16 @@ class CDPRLanguageRLEnv(_EnvBase):
 
         ee = self._get_ee_position()
         obj = self._get_body_position(self._target_body_name)
+        ee_yaw_for_reward: Optional[float] = None
+        if hasattr(self.sim, "set_yaw") or hasattr(self.sim, "get_yaw"):
+            ee_yaw_for_reward = float(self._yaw)
         reward, success, reward_info = compute_instruction_reward(
             spec=self._instruction_spec,
             ee_pos=ee,
             obj_pos=obj,
             reward_state=self._reward_state,
+            action=action,
+            ee_yaw=ee_yaw_for_reward,
             gripper_command=float(self._last_gripper_cmd),
         )
         caught_body, caught_catalog, caught_score, caught_is_target = self._detect_caught_object(ee_pos=ee)
