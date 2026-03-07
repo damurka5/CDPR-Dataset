@@ -170,9 +170,33 @@ def compute_instruction_reward(
     far_distance_threshold: float = 0.10,
     near_zero_action_threshold: float = 0.08,
     idle_penalty_gain: float = 0.30,
+    near_phase_distance: Optional[float] = None,
+    orient_gate_distance: float = 0.10,
+    w_xyz_pos_far: float = 80.0,
+    w_xyz_neg_far: float = 120.0,
+    w_xyz_pos_near: float = 20.0,
+    w_xyz_neg_near: float = 60.0,
+    w_orient_far: float = 2.0,
+    w_orient_near: float = 5.0,
+    w_obj_pos_far: float = 0.0,
+    w_obj_neg_far: float = 0.0,
+    w_obj_pos_near: float = 250.0,
+    w_obj_neg_near: float = 350.0,
+    w_lift_pos_far: float = 0.0,
+    w_lift_neg_far: float = 0.0,
+    w_lift_pos_near: float = 250.0,
+    w_lift_neg_near: float = 350.0,
+    grasp_bonus: float = 10.0,
+    follow_bonus_scale: float = 4.0,
+    action_saturation_threshold: float = 0.90,
+    action_saturation_penalty_gain: float = 1.5,
+    success_bonus: float = 75.0,
 ) -> tuple[float, bool, dict[str, float]]:
     ee_pos = np.asarray(ee_pos, dtype=np.float32)
     obj_pos = np.asarray(obj_pos, dtype=np.float32)
+
+    if near_phase_distance is None:
+        near_phase_distance = float(far_distance_threshold)
 
     if gripper_command is not None:
         if gripper_command >= close_command_threshold:
@@ -180,8 +204,32 @@ def compute_instruction_reward(
         elif gripper_command <= open_command_threshold:
             reward_state.gripper_closed = False
 
+    prev_ee_obj_dist = float(np.linalg.norm(reward_state.prev_ee_pos - reward_state.prev_obj_pos))
     ee_obj_dist = float(np.linalg.norm(ee_pos - obj_pos))
-    approach = float(np.exp(-approach_gain * ee_obj_dist))
+    approach = float(np.exp(-approach_gain * ee_obj_dist))  # debug-only signal
+    distance_delta = float(prev_ee_obj_dist - ee_obj_dist)
+
+    is_far_phase = bool(ee_obj_dist > near_phase_distance)
+    if is_far_phase:
+        w_xyz_pos = float(w_xyz_pos_far)
+        w_xyz_neg = float(w_xyz_neg_far)
+        w_orient = float(w_orient_far)
+        w_obj_pos = float(w_obj_pos_far)
+        w_obj_neg = float(w_obj_neg_far)
+        w_lift_pos = float(w_lift_pos_far)
+        w_lift_neg = float(w_lift_neg_far)
+    else:
+        w_xyz_pos = float(w_xyz_pos_near)
+        w_xyz_neg = float(w_xyz_neg_near)
+        w_orient = float(w_orient_near)
+        w_obj_pos = float(w_obj_pos_near)
+        w_obj_neg = float(w_obj_neg_near)
+        w_lift_pos = float(w_lift_pos_near)
+        w_lift_neg = float(w_lift_neg_near)
+
+    distance_improve = float(max(distance_delta, 0.0))
+    distance_worsen = float(max(-distance_delta, 0.0))
+    xyz_progress_reward = float(w_xyz_pos * distance_improve - w_xyz_neg * distance_worsen)
 
     obj_step = obj_pos - reward_state.prev_obj_pos
     ee_step = ee_pos - reward_state.prev_ee_pos
@@ -196,19 +244,31 @@ def compute_instruction_reward(
     if reward_state.prev_heading_toward is not None:
         turning_toward = float(max(heading_toward - reward_state.prev_heading_toward, 0.0))
     reward_state.prev_heading_toward = heading_toward
-    orientation_reward = 0.30 * heading_toward + 0.18 * turning_toward
+
+    orientation_gate = float(ee_obj_dist <= orient_gate_distance)
+    orientation_raw = float(heading_toward + 0.5 * turning_toward)
+    orientation_reward = float(w_orient * orientation_gate * orientation_raw)
 
     motion_action_norm = 0.0
     idle_action_penalty = 0.0
+    action_saturation_penalty = 0.0
+    action_saturation_fraction = 0.0
     if action is not None:
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         motion_dims = min(4, int(action.shape[0]))
         if motion_dims > 0:
             motion_action_norm = float(np.linalg.norm(action[:motion_dims]))
-        if ee_obj_dist > far_distance_threshold and motion_action_norm < near_zero_action_threshold:
+            abs_motion = np.abs(action[:motion_dims])
+            sat_over = np.maximum(abs_motion - action_saturation_threshold, 0.0)
+            if sat_over.size > 0:
+                action_saturation_penalty = float(action_saturation_penalty_gain * np.mean(sat_over))
+                action_saturation_fraction = float(
+                    np.mean((abs_motion > action_saturation_threshold).astype(np.float32))
+                )
+        if ee_obj_dist > near_phase_distance and motion_action_norm < near_zero_action_threshold:
             far_scale = float(
                 np.clip(
-                    (ee_obj_dist - far_distance_threshold) / max(far_distance_threshold, 1e-6),
+                    (ee_obj_dist - near_phase_distance) / max(near_phase_distance, 1e-6),
                     0.0,
                     1.0,
                 )
@@ -234,6 +294,8 @@ def compute_instruction_reward(
 
     lift = float(obj_pos[2] - reward_state.initial_obj_pos[2])
     lift_progress = float(np.clip(lift / max(spec.lift_target, 1e-6), 0.0, 1.0))
+    lift_step = float(obj_step[2])
+    lift_step_reward = float(w_lift_pos * max(lift_step, 0.0) - w_lift_neg * max(-lift_step, 0.0))
 
     displacement_xy = obj_pos[:2] - reward_state.initial_obj_pos[:2]
     direction_progress, lateral_error = _direction_progress(
@@ -242,65 +304,65 @@ def compute_instruction_reward(
         target_displacement=spec.target_displacement,
     )
 
-    move_stage = 0.0
-    approach_stage_done = 0.0
+    obj_motion_in_goal = 0.0
+    obj_motion_reward = 0.0
+    direction_norm = float(np.linalg.norm(spec.direction))
+    if direction_norm > 1e-8:
+        goal_dir = np.asarray(spec.direction[:2], dtype=np.float32) / direction_norm
+        obj_motion_in_goal = float(np.dot(obj_step[:2], goal_dir))
+        obj_motion_reward = float(
+            w_obj_pos * max(obj_motion_in_goal, 0.0) - w_obj_neg * max(-obj_motion_in_goal, 0.0)
+        )
+
+    move_stage = 1.0 if is_far_phase else 2.0
+    approach_stage_done = float(ee_obj_dist <= max(0.06, grasp_dist_threshold * 1.2))
     premature_close_penalty = 0.0
 
     if spec.instruction_type == "pick_up":
+        reward = xyz_progress_reward + orientation_reward
+        if not is_far_phase:
+            reward += lift_step_reward + follow_bonus_scale * follows_ee + 0.5 * grasp_bonus * grasp_confidence
+            move_stage = 3.0 if reward_state.grasped else 2.0
+        if newly_grasped:
+            reward += grasp_bonus
         reward = (
-            -0.01
-            + 0.35 * approach
-            + 1.50 * follows_ee
-            + 1.80 * float(reward_state.grasped)
-            + 3.50 * lift_progress
-            + orientation_reward
+            reward
             - idle_action_penalty
+            - action_saturation_penalty
         )
         success = bool(reward_state.grasped and lift_progress >= 0.95)
     else:
-        direction_alignment = float(np.exp(-8.0 * lateral_error))
-        approach_dist_threshold = max(0.06, grasp_dist_threshold * 1.2)
-        approach_stage_done = float(ee_obj_dist <= approach_dist_threshold)
-
-        if (not was_grasped) and approach_stage_done < 0.5:
+        reward = xyz_progress_reward + orientation_reward
+        if is_far_phase:
             move_stage = 1.0
             if reward_state.gripper_closed:
-                premature_close_penalty = 0.05
+                premature_close_penalty = 2.0
             reward = (
-                -0.01
-                + 0.95 * approach
-                + 0.70 * orientation_reward
+                reward
                 - idle_action_penalty
+                - action_saturation_penalty
                 - premature_close_penalty
             )
-        elif (not reward_state.grasped) or newly_grasped:
-            move_stage = 2.0
-            reward = (
-                -0.01
-                + 0.55 * approach
-                + 1.55 * grasp_confidence
-                + 1.10 * follows_ee
-                + 1.35 * float(newly_grasped)
-                + 0.35 * orientation_reward
-                - 0.35 * idle_action_penalty
-            )
         else:
-            move_stage = 3.0
+            move_stage = 3.0 if reward_state.grasped else 2.0
+            reward += obj_motion_reward + follow_bonus_scale * follows_ee + 0.5 * grasp_bonus * grasp_confidence
+            if newly_grasped:
+                reward += grasp_bonus
             reward = (
-                -0.01
-                + 0.25 * approach
-                + 0.60 * follows_ee
-                + 3.40 * direction_progress
-                + 0.50 * direction_alignment
-                - 0.20 * idle_action_penalty
+                reward
+                - 0.5 * idle_action_penalty
+                - action_saturation_penalty
             )
 
         success = bool(
             move_stage >= 3.0
             and reward_state.grasped
-            and follows_ee >= 0.55
+            and follows_ee >= 0.45
             and direction_progress >= 0.95
         )
+
+    if success:
+        reward += float(success_bonus)
 
     reward_state.prev_ee_pos = ee_pos.copy()
     reward_state.prev_obj_pos = obj_pos.copy()
@@ -308,22 +370,35 @@ def compute_instruction_reward(
 
     info = {
         "distance_ee_to_object": ee_obj_dist,
+        "distance_delta": distance_delta,
+        "phase_is_far": float(is_far_phase),
         "approach_reward": approach,
+        "xyz_progress_reward": xyz_progress_reward,
+        "distance_improve": distance_improve,
+        "distance_worsen": distance_worsen,
         "follow_score": follows_ee,
         "heading_toward_target": heading_toward,
         "turning_toward_target": turning_toward,
+        "orientation_gate": orientation_gate,
+        "orientation_raw": orientation_raw,
         "orientation_reward": orientation_reward,
         "motion_action_norm": motion_action_norm,
         "idle_action_penalty": idle_action_penalty,
+        "action_saturation_penalty": action_saturation_penalty,
+        "action_saturation_fraction": action_saturation_fraction,
         "grasp_confidence": float(grasp_confidence),
         "gripper_closed": float(reward_state.gripper_closed),
         "grasped": float(reward_state.grasped),
         "newly_grasped": float(newly_grasped),
         "lift_progress": lift_progress,
+        "lift_step_reward": lift_step_reward,
+        "obj_motion_in_goal": obj_motion_in_goal,
+        "obj_motion_reward": obj_motion_reward,
         "direction_progress": direction_progress,
         "lateral_error": lateral_error,
         "move_stage": move_stage,
         "approach_stage_done": approach_stage_done,
         "premature_close_penalty": premature_close_penalty,
+        "success_bonus": float(success_bonus if success else 0.0),
     }
     return float(reward), success, info
