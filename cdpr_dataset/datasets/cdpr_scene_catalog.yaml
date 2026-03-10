@@ -1,9 +1,9 @@
 defaults:
   scene_z: -0.85
-  ee_start: [0.0, 0.0, 0.25]
+  ee_start: [0.0, 0.0, 0.35]
   table_z: 0.15
   object_dynamic: true
-  settle_time: 1.0
+  settle_time: 0.0
 
 scenes:
   - name: desk

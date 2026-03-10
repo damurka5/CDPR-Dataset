@@ -478,28 +478,183 @@ def script_put_into_bowl(sim,
 def _geom_footprint_radius(model, geom_id):
     gtype = model.geom_type[geom_id]
     size = model.geom_size[geom_id]
-    if gtype == 6:  # box
+    try:
+        import mujoco as mj
+        g_box = int(mj.mjtGeom.mjGEOM_BOX)
+        g_cylinder = int(mj.mjtGeom.mjGEOM_CYLINDER)
+        g_sphere = int(mj.mjtGeom.mjGEOM_SPHERE)
+    except Exception:
+        g_box, g_cylinder, g_sphere = 6, 4, 0
+
+    if gtype == g_box:  # box
         r = float(np.linalg.norm(size[:2]))  # diagonal half-length in XY
         return max(0.03, r)
-    elif gtype == 4 or gtype == 0:  # cylinder or sphere
+    elif gtype == g_cylinder or gtype == g_sphere:  # cylinder or sphere
         return max(0.03, float(size[0]))
     else:
         return 0.04
 
-def place_objects_non_overlapping(sim, object_body_names, xy_bounds, min_gap=0.02, max_tries=200):
+def _body_has_free_joint(model, bid):
+    try:
+        import mujoco as mj
+        free_type = int(mj.mjtJoint.mjJNT_FREE)
+    except Exception:
+        free_type = 0
+    jn = int(model.body_jntnum[bid])
+    ja = int(model.body_jntadr[bid])
+    for k in range(jn):
+        jid = ja + k
+        if model.jnt_type[jid] == free_type:
+            return True
+    return False
+
+def _geom_world_half_extents(model, data, gid):
+    try:
+        import mujoco as mj
+        g_box = int(mj.mjtGeom.mjGEOM_BOX)
+        g_cylinder = int(mj.mjtGeom.mjGEOM_CYLINDER)
+        g_capsule = int(mj.mjtGeom.mjGEOM_CAPSULE)
+        g_sphere = int(mj.mjtGeom.mjGEOM_SPHERE)
+    except Exception:
+        g_box, g_cylinder, g_capsule, g_sphere = 6, 4, 3, 0
+
+    gtype = int(model.geom_type[gid])
+    size = model.geom_size[gid]
+    xmat = data.geom_xmat[gid].reshape(3, 3)
+
+    if gtype == g_box:      # box
+        half_local = np.array([size[0], size[1], size[2]], dtype=float)
+    elif gtype == g_cylinder:    # cylinder
+        half_local = np.array([size[0], size[0], size[1]], dtype=float)
+    elif gtype == g_capsule:    # capsule
+        half_local = np.array([size[0], size[0], size[1] + size[0]], dtype=float)
+    elif gtype == g_sphere:    # sphere
+        half_local = np.array([size[0], size[0], size[0]], dtype=float)
+    else:
+        # Fallback radius bound for meshes/others.
+        r = float(model.geom_rbound[gid])
+        half_local = np.array([r, r, r], dtype=float)
+
+    return np.abs(xmat) @ half_local
+
+def _infer_workspace_surface_z(sim, fallback_z=0.0):
     """
-    Randomly place objects by setting their body pose XY at a fixed Z, avoiding XY overlap
+    Estimate the support surface height in world Z.
+    Priority:
+    1) Table/desk-like static slabs (highest top-z).
+    2) Geom named like floor/ground (plane z).
+    3) Fallback.
+    """
+    import mujoco as mj
+
+    model, data = sim.model, sim.data
+    try:
+        g_box = int(mj.mjtGeom.mjGEOM_BOX)
+        g_plane = int(mj.mjtGeom.mjGEOM_PLANE)
+    except Exception:
+        g_box, g_plane = 6, 7
+    table_top_z = None
+    floor_z = None
+
+    for gid in range(model.ngeom):
+        bid = int(model.geom_bodyid[gid])
+        bname = mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, bid) or ""
+        gname = mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, gid) or ""
+
+        # Ignore dynamic bodies and CDPR robot internals for support detection.
+        if _body_has_free_joint(model, bid):
+            continue
+        if (
+            bname.startswith("rotor_")
+            or bname.startswith("slider_")
+            or bname.startswith("ee_")
+            or bname.startswith("camera_")
+            or bname.startswith("finger_")
+            or bname == "yaw_frame"
+            or bname == "ee_platform"
+        ):
+            continue
+
+        gtype = int(model.geom_type[gid])
+        gpos = data.geom_xpos[gid]
+
+        # Plane geoms often encode the ground directly.
+        if gtype == g_plane and ("floor" in gname.lower() or "ground" in gname.lower()):
+            z = float(gpos[2])
+            floor_z = z if floor_z is None else max(floor_z, z)
+            continue
+
+        half_world = _geom_world_half_extents(model, data, gid)
+        top_z = float(gpos[2] + half_world[2])
+        size = model.geom_size[gid]
+
+        # Detect large, flat slabs (desk/table tops) even when unnamed.
+        if gtype == g_box:
+            dims = sorted([float(size[0]), float(size[1]), float(size[2])])
+            is_flat_slab = dims[0] < 0.10 and dims[1] > 0.20 and dims[2] > 0.20
+            has_table_name = any(k in gname.lower() for k in ("desk", "table", "counter", "surface"))
+            if is_flat_slab or has_table_name:
+                table_top_z = top_z if table_top_z is None else max(table_top_z, top_z)
+
+    if table_top_z is not None:
+        return table_top_z
+    if floor_z is not None:
+        return floor_z
+
+    sim_table_z = getattr(sim, "table_z", None)
+    if sim_table_z is not None:
+        try:
+            return float(sim_table_z)
+        except Exception:
+            pass
+    return float(fallback_z)
+
+def _body_bottom_offset(sim, body_name):
+    """
+    Distance from body origin z to the lowest geom point in its subtree.
+    """
+    import mujoco as mj
+
+    model, data = sim.model, sim.data
+    bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, body_name)
+    if bid == -1:
+        return 0.0
+    mn, _ = aabb_of_body(sim, body_name, include_subtree=True)
+    body_z = float(data.xpos[bid][2])
+    return max(0.0, body_z - float(mn[2]))
+
+def infer_workspace_surface_z(sim, fallback_z=0.0):
+    return _infer_workspace_surface_z(sim, fallback_z=fallback_z)
+
+def body_bottom_offset(sim, body_name):
+    return _body_bottom_offset(sim, body_name)
+
+def place_objects_non_overlapping(
+    sim,
+    object_body_names,
+    xy_bounds,
+    min_gap=0.02,
+    max_tries=200,
+    min_ee_dist=0.08,
+    support_clearance=0.002,
+):
+    """
+    Randomly place objects by setting their body pose XY while grounding each object on
+    the inferred support surface (table/floor), avoiding XY overlap,
     and avoiding spawning under the end-effector.
-    - xy_bounds = ((xmin, xmax), (ymin, ymax), fixed_z)
+    - xy_bounds = ((xmin, xmax), (ymin, ymax), z_hint)
     - Uses each body's first geom footprint to estimate radius.
     For single-object episodes, just pass ['target_object'].
     """
     import mujoco as mj
     model, data = sim.model, sim.data
-    xmin, xmax = xy_bounds[0]; ymin, ymax = xy_bounds[1]; z_fixed = xy_bounds[2]
+    xmin, xmax = xy_bounds[0]
+    ymin, ymax = xy_bounds[1]
+    z_hint = xy_bounds[2]
+    surface_z = _infer_workspace_surface_z(sim, fallback_z=z_hint)
 
-    # ---- NEW: avoid placing objects too close to the current EE XY ----
-    MIN_EE_DIST = 0.05  # 5 cm
+    # Avoid placing objects too close to the current EE XY.
+    min_ee_dist = float(min_ee_dist)
 
     if hasattr(sim, "get_end_effector_position"):
         ee = sim.get_end_effector_position().copy()
@@ -508,16 +663,20 @@ def place_objects_non_overlapping(sim, object_body_names, xy_bounds, min_gap=0.0
         # fallback: assume EE at origin if we can't query it
         ee_x, ee_y = 0.0, 0.0
 
-    def far_from_ee(x, y, min_dist=MIN_EE_DIST):
+    def far_from_ee(x, y, min_dist=min_ee_dist):
         return (x - ee_x) ** 2 + (y - ee_y) ** 2 >= (min_dist ** 2)
 
     placed = []
     for name in object_body_names:
         bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name)
+        if bid == -1:
+            raise RuntimeError(f"Body '{name}' not found for placement.")
         geom_ids = np.where(model.geom_bodyid == bid)[0]
         r = 0.05
         if len(geom_ids) > 0:
             r = _geom_footprint_radius(model, int(geom_ids[0]))
+        z_offset = _body_bottom_offset(sim, name)
+        z_target = float(surface_z + z_offset + float(support_clearance))
         ok = False
 
         for _ in range(max_tries):
@@ -540,12 +699,12 @@ def place_objects_non_overlapping(sim, object_body_names, xy_bounds, min_gap=0.0
                     jid = jadr + k
                     if model.jnt_type[jid] == mj.mjtJoint.mjJNT_FREE:
                         qadr = model.jnt_qposadr[jid]
-                        data.qpos[qadr:qadr+3] = np.array([x, y, z_fixed], dtype=float)
+                        data.qpos[qadr:qadr+3] = np.array([x, y, z_target], dtype=float)
                         free_found = True
                         break
                 if not free_found:
                     # fallback: move kinematic body via xpos (rare for LIBERO objects)
-                    data.xpos[bid] = np.array([x, y, z_fixed], dtype=float)
+                    data.xpos[bid] = np.array([x, y, z_target], dtype=float)
 
                 placed.append((x, y, r))
                 ok = True

@@ -30,6 +30,7 @@ NPZ_DIR   = DATASET_ROOT / "npz"
 VIDEO_DIR = DATASET_ROOT / "videos"
 TFREC_DIR = DATASET_ROOT / "tfrecords"
 WRAP_DIR  = HERE / "wrappers"
+MIN_EE_START_Z = 0.35
 
 def ensure_dirs():
     for d in [NPZ_DIR, VIDEO_DIR, TFREC_DIR, WRAP_DIR]:
@@ -114,12 +115,31 @@ def _auto_detect_object_body(sim, preferred: str | None = None) -> str:
         f"Available bodies: {', '.join(sample[:30])}{' ...' if len(sample) > 30 else ''}"
     )
 
+def _discover_movable_object_bodies(sim) -> list[str]:
+    import mujoco as mj
+
+    m = sim.model
+    robot_prefixes = ("rotor_", "slider_", "ee_", "camera_", "yaw_frame", "ee_platform", "finger_")
+    bodies: list[str] = []
+    for bid in range(m.nbody):
+        name = mj.mj_id2name(m, mj.mjtObj.mjOBJ_BODY, bid)
+        if not name or name == "world":
+            continue
+        if any(name.startswith(pfx) for pfx in robot_prefixes):
+            continue
+        jn = int(m.body_jntnum[bid])
+        ja = int(m.body_jntadr[bid])
+        has_free = any(m.jnt_type[ja + k] == mj.mjtJoint.mjJNT_FREE for k in range(jn))
+        if has_free:
+            bodies.append(name)
+    return bodies
+
 def build_wrapper_if_needed(scene_name: str,
                             object_names: list[str],
                             scene_z=-0.85,
-                            ee_start=(0.0, 0.0, 0.25),
+                            ee_start=(0.0, 0.0, 0.35),
                             table_z=0.15,
-                            settle_time=1.0,
+                            settle_time=0.0,
                             wrapper_out: str | Path | None = None,
                             use_cache: bool = True) -> Path:
     """
@@ -148,6 +168,9 @@ def build_wrapper_if_needed(scene_name: str,
             # Continue and let scene switcher attempt to overwrite.
             pass
 
+    ee_start = np.asarray(ee_start, dtype=float).reshape(3)
+    ee_start[2] = max(float(ee_start[2]), MIN_EE_START_Z)
+
     cmd = [
         sys.executable, "-m", "cdpr_mujoco.cdpr_scene_switcher",
         "--scene", scene_name,
@@ -170,7 +193,7 @@ def build_wrapper_if_needed(scene_name: str,
     # ---------- NEW: placement logic with "avoid gripper" constraint ----------
     # ee_start is a function argument: (x, y, z)
     ee_x, ee_y = float(ee_start[0]), float(ee_start[1])
-    MIN_EE_DIST = 0.05  # 5 cm in XY
+    MIN_EE_DIST = 0.10  # keep initial objects 10 cm away from EE in XY
 
     def far_from_ee(x, y, min_dist=MIN_EE_DIST):
         return (x - ee_x) ** 2 + (y - ee_y) ** 2 >= (min_dist ** 2)
@@ -311,12 +334,17 @@ def run_episode(task_name: str, wrapper_xml: Path, catalog_object_name: str):
     sim.initialize()
 
     real_obj = sim.get_object_body_name() or catalog_object_name
+    movable_objects = _discover_movable_object_bodies(sim)
+    if real_obj and real_obj not in movable_objects:
+        movable_objects.append(real_obj)
     print(f"[run_episode] Using object body in model: {real_obj}")
+    print(f"[run_episode] Placing objects: {movable_objects}")
 
     # CENTRAL placement window
     try:
-        xy_bounds = ((-0.12, 0.12), (-0.12, 0.12), 0.10)
-        place_objects_non_overlapping(sim, [real_obj], xy_bounds, min_gap=0.015)
+        # z value is a hint; placement helper grounds each object on support surface.
+        xy_bounds = ((-0.12, 0.12), (-0.12, 0.12), 0.0)
+        place_objects_non_overlapping(sim, movable_objects, xy_bounds, min_gap=0.015)
     except Exception as e:
         print("Object placement note:", e)
 
@@ -325,24 +353,24 @@ def run_episode(task_name: str, wrapper_xml: Path, catalog_object_name: str):
     import numpy as np
 
     m, d = sim.model, sim.data
-    bid = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, real_obj)
-    if bid != -1:
-        # body_quat is [w, x, y, z] from MJCF (includes your cdpr_scene_switcher quat)
+    for obj_name in movable_objects:
+        bid = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, obj_name)
+        if bid == -1:
+            continue
+        # body_quat is [w, x, y, z] from MJCF (includes cdpr_scene_switcher quat).
         body_q = m.body_quat[bid].copy()
-        print(f"[debug] model.body_quat for {real_obj} = {body_q}")
-
         jn = m.body_jntnum[bid]
         ja = m.body_jntadr[bid]
         for k in range(jn):
             jid = ja + k
             if m.jnt_type[jid] == mj.mjtJoint.mjJNT_FREE:
                 qadr = m.jnt_qposadr[jid]
-                # qpos[qadr:qadr+3] already set by place_objects_non_overlapping for position
-                d.qpos[qadr+3:qadr+7] = body_q  # copy [w,x,y,z]
-                print(f"[debug] set freejoint qpos quat for {real_obj} to {body_q}")
+                d.qpos[qadr+3:qadr+7] = body_q  # [w,x,y,z]
                 break
 
-        mj.mj_forward(m, d)
+    mj.mj_forward(m, d)
+    bid = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, real_obj)
+    if bid != -1:
         print(f"[debug] world xquat for {real_obj} after sync = {d.xquat[bid]}")
 
     # Now recompute centers after orientation is applied
@@ -431,8 +459,9 @@ def main():
     for scene_name, object_names, defaults in scene_specs:
         scene_z   = defaults.get("scene_z", -0.85)
         ee_start  = list(defaults.get("ee_start", (0.0, 0.0, 0.45)))
+        ee_start[2] = max(float(ee_start[2]), MIN_EE_START_Z)
         table_z   = defaults.get("table_z", 0.15)
-        settle_t  = defaults.get("settle_time", 1.0)
+        settle_t  = defaults.get("settle_time", 0.0)
         # if any("bowl" in obj for obj in object_names):
         #     ee_start[2] = max(ee_start[2], 0.35)   # raise to at least 0.35 m
 

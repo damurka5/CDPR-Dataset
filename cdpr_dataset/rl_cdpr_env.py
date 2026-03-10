@@ -31,7 +31,13 @@ from .rl_instruction_tasks import (
     instruction_to_onehot,
     sample_instruction,
 )
-from .synthetic_tasks import clamp_xyz, place_objects_non_overlapping, resolve_body_name
+from .synthetic_tasks import (
+    body_bottom_offset,
+    clamp_xyz,
+    infer_workspace_surface_z,
+    place_objects_non_overlapping,
+    resolve_body_name,
+)
 
 
 HERE = Path(__file__).resolve().parent
@@ -40,6 +46,7 @@ DEFAULT_VIDEO_DIR = HERE / "datasets" / "cdpr_synth" / "videos"
 DEFAULT_ALLOWED_OBJECTS: tuple[str, ...] = ("ycb_apple", "ycb_pear", "ycb_peach")
 DEFAULT_DESK_GEOM_REGEX = r"(table|desk|workbench|counter|surface)"
 WRAP_DIR = HERE / "wrappers"
+MIN_EE_START_Z = 0.35
 
 ROBOT_BODY_PREFIXES = (
     "world",
@@ -433,6 +440,9 @@ class CDPRLanguageRLEnv(_EnvBase):
         self._prev_ee_for_catch = np.zeros((3,), dtype=np.float32)
         self._last_caught_body = ""
         self._last_caught_catalog = ""
+        self._support_surface_z = 0.0
+        self._ee_min_z = float("-inf")
+        self._ee_spawn_z = float("-inf")
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict[str, Any]] = None):
         if seed is not None:
@@ -449,6 +459,8 @@ class CDPRLanguageRLEnv(_EnvBase):
         self.sim.initialize()
         if hasattr(self.sim, "hold_current_pose"):
             self.sim.hold_current_pose(warm_steps=10)
+        self._refresh_workspace_safety()
+        self._move_ee_to_spawn_height()
 
         self._catalog_to_body, self._object_body_names = self._resolve_objects(scene.objects)
         self._inverse_catalog_to_body = {v: k for k, v in self._catalog_to_body.items()}
@@ -457,8 +469,9 @@ class CDPRLanguageRLEnv(_EnvBase):
                 place_objects_non_overlapping(
                     self.sim,
                     self._object_body_names,
-                    xy_bounds=((-0.20, 0.20), (-0.20, 0.20), 0.10),
+                    xy_bounds=((-0.20, 0.20), (-0.20, 0.20), self._support_surface_z),
                     min_gap=0.02,
+                    min_ee_dist=0.10,
                 )
             except Exception:
                 # Continue if placement fails; wrapper-provided placement is still valid.
@@ -592,14 +605,16 @@ class CDPRLanguageRLEnv(_EnvBase):
         if (not use_cache) or self.wrapper_cleanup:
             wrapper_out = self._temporary_wrapper_path(scene=scene)
             use_cache = False
+        ee_start = np.asarray(self.defaults.get("ee_start", (0.0, 0.0, MIN_EE_START_Z)), dtype=float).reshape(3)
+        ee_start[2] = max(float(ee_start[2]), MIN_EE_START_Z)
 
         wrapper_xml = build_wrapper_if_needed(
             scene_name=scene.name,
             object_names=list(scene.objects),
             scene_z=self.defaults.get("scene_z", -0.85),
-            ee_start=self.defaults.get("ee_start", (0.0, 0.0, 0.25)),
+            ee_start=tuple(float(x) for x in ee_start),
             table_z=self.defaults.get("table_z", 0.15),
-            settle_time=self.defaults.get("settle_time", 1.0),
+            settle_time=self.defaults.get("settle_time", 0.0),
             wrapper_out=wrapper_out,
             use_cache=use_cache,
         )
@@ -628,6 +643,33 @@ class CDPRLanguageRLEnv(_EnvBase):
                     self._register_cleanup_path(path)
 
         return wrapper_xml
+
+    def _refresh_workspace_safety(self):
+        self._support_surface_z = float(infer_workspace_surface_z(self.sim, fallback_z=0.0))
+        ee_bottom = float(body_bottom_offset(self.sim, "ee_base"))
+        # Keep tool lowest point >= 5 cm above support; spawn at >= 8 cm.
+        self._ee_min_z = self._support_surface_z + ee_bottom + 0.05
+        self._ee_spawn_z = self._support_surface_z + ee_bottom + 0.08
+
+    def _move_ee_to_spawn_height(self):
+        if self.sim is None:
+            return
+        ee = self._get_ee_position().astype(np.float64)
+        if ee[2] >= self._ee_spawn_z - 1e-4:
+            return
+        target = ee.copy()
+        target[2] = self._ee_spawn_z
+        self._set_ee_target(target)
+        if hasattr(self.sim, "goto"):
+            try:
+                self.sim.goto(target, max_steps=120, tol=0.01)
+            except Exception:
+                pass
+        if hasattr(self.sim, "hold_current_pose"):
+            try:
+                self.sim.hold_current_pose(warm_steps=6)
+            except Exception:
+                pass
 
     def _temporary_wrapper_path(self, scene: SceneSpec) -> Path:
         obj_part = "-".join(sorted(scene.objects))
@@ -776,6 +818,8 @@ class CDPRLanguageRLEnv(_EnvBase):
         ee = self._get_ee_position()
         dxyz = action[:3] * self.action_step_xyz
         target = clamp_xyz(ee + dxyz)
+        if np.isfinite(self._ee_min_z):
+            target[2] = max(float(target[2]), float(self._ee_min_z))
         self._set_ee_target(target.astype(np.float32))
 
         if hasattr(self.sim, "set_yaw"):
@@ -831,4 +875,7 @@ class CDPRLanguageRLEnv(_EnvBase):
             "gripper_command": float(self._last_gripper_cmd),
             "desk_texture": self._desk_texture_name,
             "wrapper_xml": str(self._current_wrapper_xml) if self._current_wrapper_xml else "",
+            "support_surface_z": float(self._support_surface_z),
+            "ee_min_z": float(self._ee_min_z) if np.isfinite(self._ee_min_z) else float("nan"),
+            "ee_spawn_z": float(self._ee_spawn_z) if np.isfinite(self._ee_spawn_z) else float("nan"),
         }
