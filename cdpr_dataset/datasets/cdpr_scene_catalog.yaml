@@ -7,20 +7,34 @@ defaults:
 
 scenes:
   - name: desk
-    objects: [ycb_apple, bowl]
-  # - name: desk
-  #   objects: [orange_juice]
-  # - name: desk
-  #   objects: [milk]
-  # - name: desk
-  #   objects: [cookies]
-  # - name: living_room_table
-  #   objects: [milk]
-  # - name: short_coffee_table
-  #   objects: [cookies]
-  # - name: desk
-  #   objects: [ketchup, orange_juice, alphabet_soup]
-  # - name: living_room_table
-  #   objects: [milk, cookies]
-  # - name: short_coffee_table
-  #   objects: [milk, cookies]
+    objects: [ycb_apple]
+  - name: desk
+    objects: [ycb_apple, ycb_peach]
+  - name: desk
+    objects: [ycb_apple, ycb_pear]
+  - name: desk
+    objects: [ycb_apple, ycb_banana]
+  - name: desk
+    objects: [ycb_apple, ycb_peach, ycb_pear]
+  - name: desk
+    objects: [ycb_apple, ycb_peach, ycb_banana]
+  - name: desk
+    objects: [ycb_apple, ycb_pear, ycb_banana]
+  - name: desk
+    objects: [ycb_apple, ycb_pear, ycb_banana, ycb_peach]
+  - name: desk
+    objects: [ycb_apple]
+  - name: desk
+    objects: [ycb_apple, ycb_peach]
+  - name: desk
+    objects: [ycb_apple, ycb_pear]
+  - name: desk
+    objects: [ycb_apple, ycb_banana]
+  - name: desk
+    objects: [ycb_apple, ycb_peach, ycb_pear]
+  - name: desk
+    objects: [ycb_apple, ycb_peach, ycb_banana]
+  - name: desk
+    objects: [ycb_apple, ycb_pear, ycb_banana]
+  - name: desk
+    objects: [ycb_apple, ycb_pear, ycb_banana, ycb_peach]
