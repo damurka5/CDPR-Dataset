@@ -542,6 +542,11 @@ class CDPRLanguageRLEnv(_EnvBase):
         obj = self._get_body_position(self._target_body_name)
         gripper_surface_alignment = self._get_gripper_surface_alignment(obj_pos=obj)
         camera_alignment = self._get_ee_camera_alignment(obj_pos=obj)
+        ee_height_above_surface: Optional[float]
+        if np.isfinite(self._support_surface_z):
+            ee_height_above_surface = float(ee[2] - self._support_surface_z)
+        else:
+            ee_height_above_surface = None
         ee_yaw_for_reward: Optional[float] = None
         if hasattr(self.sim, "set_yaw") or hasattr(self.sim, "get_yaw"):
             ee_yaw_for_reward = float(self._yaw)
@@ -554,6 +559,7 @@ class CDPRLanguageRLEnv(_EnvBase):
             ee_yaw=ee_yaw_for_reward,
             gripper_surface_alignment=gripper_surface_alignment,
             camera_alignment=camera_alignment,
+            ee_height_above_surface=ee_height_above_surface,
             gripper_command=float(self._last_gripper_cmd),
         )
         caught_body, caught_catalog, caught_score, caught_is_target = self._detect_caught_object(ee_pos=ee)

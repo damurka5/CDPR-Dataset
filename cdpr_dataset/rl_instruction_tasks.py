@@ -164,6 +164,7 @@ def compute_instruction_reward(
     ee_yaw: Optional[float] = None,
     gripper_surface_alignment: Optional[float] = None,
     camera_alignment: Optional[float] = None,
+    ee_height_above_surface: Optional[float] = None,
     gripper_command: Optional[float] = None,
     close_command_threshold: float = 0.2,
     open_command_threshold: float = -0.2,
@@ -176,6 +177,9 @@ def compute_instruction_reward(
     idle_penalty_gain: float = 0.30,
     near_phase_distance: Optional[float] = None,
     orient_gate_distance: float = 0.10,
+    min_ee_height_before_reach: float = 0.10,
+    z_height_reach_distance: Optional[float] = None,
+    z_height_penalty_gain: float = 120.0,
     w_xyz_pos_far: float = 80.0,
     w_xyz_neg_far: float = 120.0,
     w_xyz_pos_near: float = 20.0,
@@ -205,6 +209,8 @@ def compute_instruction_reward(
 
     if near_phase_distance is None:
         near_phase_distance = float(far_distance_threshold)
+    if z_height_reach_distance is None:
+        z_height_reach_distance = float(max(0.06, grasp_dist_threshold * 1.2))
 
     if gripper_command is not None:
         if gripper_command >= close_command_threshold:
@@ -293,6 +299,13 @@ def compute_instruction_reward(
         heading_orientation_reward + gripper_orientation_reward + camera_orientation_reward
     )
 
+    height_below_target = 0.0
+    z_height_penalty_active = False
+    if ee_height_above_surface is not None and ee_obj_dist > z_height_reach_distance:
+        height_below_target = float(max(min_ee_height_before_reach - ee_height_above_surface, 0.0))
+        z_height_penalty_active = True
+    z_height_penalty = float(z_height_penalty_gain * height_below_target)
+
     motion_action_norm = 0.0
     idle_action_penalty = 0.0
     action_saturation_penalty = 0.0
@@ -373,6 +386,7 @@ def compute_instruction_reward(
             reward
             - idle_action_penalty
             - action_saturation_penalty
+            - z_height_penalty
         )
         success = bool(reward_state.grasped and lift_progress >= 0.95)
     else:
@@ -386,6 +400,7 @@ def compute_instruction_reward(
                 - idle_action_penalty
                 - action_saturation_penalty
                 - premature_close_penalty
+                - z_height_penalty
             )
         else:
             move_stage = 3.0 if reward_state.grasped else 2.0
@@ -396,6 +411,7 @@ def compute_instruction_reward(
                 reward
                 - 0.5 * idle_action_penalty
                 - action_saturation_penalty
+                - z_height_penalty
             )
 
         success = bool(
@@ -436,6 +452,14 @@ def compute_instruction_reward(
         "camera_orientation_reward": camera_orientation_reward,
         "orientation_raw": orientation_raw,
         "orientation_reward": orientation_reward,
+        "ee_height_above_surface": (
+            float(ee_height_above_surface) if ee_height_above_surface is not None else float("nan")
+        ),
+        "min_ee_height_before_reach": float(min_ee_height_before_reach),
+        "z_height_reach_distance": float(z_height_reach_distance),
+        "z_height_penalty_active": float(z_height_penalty_active),
+        "z_height_deficit": height_below_target,
+        "z_height_penalty": z_height_penalty,
         "motion_action_norm": motion_action_norm,
         "idle_action_penalty": idle_action_penalty,
         "action_saturation_penalty": action_saturation_penalty,
