@@ -39,6 +39,7 @@ class RewardState:
     prev_ee_pos: np.ndarray
     prev_obj_pos: np.ndarray
     prev_heading_toward: Optional[float] = None
+    prev_ee_motion_align: Optional[float] = None
     prev_gripper_surface_align: Optional[float] = None
     prev_camera_align: Optional[float] = None
     gripper_closed: bool = False
@@ -180,6 +181,11 @@ def compute_instruction_reward(
     min_ee_height_before_reach: float = 0.10,
     z_height_reach_distance: Optional[float] = None,
     z_height_penalty_gain: float = 120.0,
+    motion_dir_gate_distance: Optional[float] = None,
+    w_motion_dir_pos_far: float = 40.0,
+    w_motion_dir_neg_far: float = 60.0,
+    w_motion_dir_pos_near: float = 15.0,
+    w_motion_dir_neg_near: float = 25.0,
     w_xyz_pos_far: float = 80.0,
     w_xyz_neg_far: float = 120.0,
     w_xyz_pos_near: float = 20.0,
@@ -211,6 +217,8 @@ def compute_instruction_reward(
         near_phase_distance = float(far_distance_threshold)
     if z_height_reach_distance is None:
         z_height_reach_distance = float(max(0.06, grasp_dist_threshold * 1.2))
+    if motion_dir_gate_distance is None:
+        motion_dir_gate_distance = float(max(0.06, grasp_dist_threshold * 1.2))
 
     if gripper_command is not None:
         if gripper_command >= close_command_threshold:
@@ -230,6 +238,8 @@ def compute_instruction_reward(
         w_orient = float(w_orient_far)
         w_gripper_orient = float(w_gripper_orient_far)
         w_camera_orient = float(w_camera_orient_far)
+        w_motion_dir_pos = float(w_motion_dir_pos_far)
+        w_motion_dir_neg = float(w_motion_dir_neg_far)
         w_obj_pos = float(w_obj_pos_far)
         w_obj_neg = float(w_obj_neg_far)
         w_lift_pos = float(w_lift_pos_far)
@@ -240,6 +250,8 @@ def compute_instruction_reward(
         w_orient = float(w_orient_near)
         w_gripper_orient = float(w_gripper_orient_near)
         w_camera_orient = float(w_camera_orient_near)
+        w_motion_dir_pos = float(w_motion_dir_pos_near)
+        w_motion_dir_neg = float(w_motion_dir_neg_near)
         w_obj_pos = float(w_obj_pos_near)
         w_obj_neg = float(w_obj_neg_near)
         w_lift_pos = float(w_lift_pos_near)
@@ -305,6 +317,35 @@ def compute_instruction_reward(
         height_below_target = float(max(min_ee_height_before_reach - ee_height_above_surface, 0.0))
         z_height_penalty_active = True
     z_height_penalty = float(z_height_penalty_gain * height_below_target)
+
+    ee_motion_toward = 0.0
+    ee_motion_away = 0.0
+    ee_motion_alignment = 0.0
+    ee_motion_turning = 0.0
+    motion_dir_gate = float(ee_obj_dist > motion_dir_gate_distance)
+    if motion_dir_gate > 0.0:
+        to_obj_prev = obj_pos - reward_state.prev_ee_pos
+        to_obj_prev_norm = float(np.linalg.norm(to_obj_prev))
+        ee_step_norm = float(np.linalg.norm(ee_step))
+        if to_obj_prev_norm > 1e-8 and ee_step_norm > 1e-8:
+            to_obj_prev_unit = to_obj_prev / to_obj_prev_norm
+            motion_projection = float(np.dot(ee_step, to_obj_prev_unit))
+            ee_motion_toward = float(max(motion_projection, 0.0))
+            ee_motion_away = float(max(-motion_projection, 0.0))
+            ee_motion_alignment = float(np.clip(motion_projection / ee_step_norm, -1.0, 1.0))
+
+    if reward_state.prev_ee_motion_align is not None:
+        ee_motion_turning = float(max(ee_motion_alignment - reward_state.prev_ee_motion_align, 0.0))
+    reward_state.prev_ee_motion_align = ee_motion_alignment
+
+    motion_dir_reward = float(
+        motion_dir_gate
+        * (
+            w_motion_dir_pos * ee_motion_toward
+            - w_motion_dir_neg * ee_motion_away
+            + 0.5 * w_motion_dir_pos * ee_motion_turning
+        )
+    )
 
     motion_action_norm = 0.0
     idle_action_penalty = 0.0
@@ -376,7 +417,7 @@ def compute_instruction_reward(
     premature_close_penalty = 0.0
 
     if spec.instruction_type == "pick_up":
-        reward = xyz_progress_reward + orientation_reward
+        reward = xyz_progress_reward + orientation_reward + motion_dir_reward
         if not is_far_phase:
             reward += lift_step_reward + follow_bonus_scale * follows_ee + 0.5 * grasp_bonus * grasp_confidence
             move_stage = 3.0 if reward_state.grasped else 2.0
@@ -390,7 +431,7 @@ def compute_instruction_reward(
         )
         success = bool(reward_state.grasped and lift_progress >= 0.95)
     else:
-        reward = xyz_progress_reward + orientation_reward
+        reward = xyz_progress_reward + orientation_reward + motion_dir_reward
         if is_far_phase:
             move_stage = 1.0
             if reward_state.gripper_closed:
@@ -452,6 +493,12 @@ def compute_instruction_reward(
         "camera_orientation_reward": camera_orientation_reward,
         "orientation_raw": orientation_raw,
         "orientation_reward": orientation_reward,
+        "motion_dir_gate": motion_dir_gate,
+        "ee_motion_toward": ee_motion_toward,
+        "ee_motion_away": ee_motion_away,
+        "ee_motion_alignment": ee_motion_alignment,
+        "ee_motion_turning": ee_motion_turning,
+        "motion_dir_reward": motion_dir_reward,
         "ee_height_above_surface": (
             float(ee_height_above_surface) if ee_height_above_surface is not None else float("nan")
         ),
