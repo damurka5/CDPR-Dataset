@@ -39,6 +39,8 @@ class RewardState:
     prev_ee_pos: np.ndarray
     prev_obj_pos: np.ndarray
     prev_heading_toward: Optional[float] = None
+    prev_gripper_surface_align: Optional[float] = None
+    prev_camera_align: Optional[float] = None
     gripper_closed: bool = False
     grasped: bool = False
     step_count: int = 0
@@ -160,6 +162,8 @@ def compute_instruction_reward(
     reward_state: RewardState,
     action: Optional[np.ndarray] = None,
     ee_yaw: Optional[float] = None,
+    gripper_surface_alignment: Optional[float] = None,
+    camera_alignment: Optional[float] = None,
     gripper_command: Optional[float] = None,
     close_command_threshold: float = 0.2,
     open_command_threshold: float = -0.2,
@@ -178,6 +182,10 @@ def compute_instruction_reward(
     w_xyz_neg_near: float = 60.0,
     w_orient_far: float = 2.0,
     w_orient_near: float = 5.0,
+    w_gripper_orient_far: float = 1.5,
+    w_gripper_orient_near: float = 4.0,
+    w_camera_orient_far: float = 1.0,
+    w_camera_orient_near: float = 3.0,
     w_obj_pos_far: float = 0.0,
     w_obj_neg_far: float = 0.0,
     w_obj_pos_near: float = 250.0,
@@ -214,6 +222,8 @@ def compute_instruction_reward(
         w_xyz_pos = float(w_xyz_pos_far)
         w_xyz_neg = float(w_xyz_neg_far)
         w_orient = float(w_orient_far)
+        w_gripper_orient = float(w_gripper_orient_far)
+        w_camera_orient = float(w_camera_orient_far)
         w_obj_pos = float(w_obj_pos_far)
         w_obj_neg = float(w_obj_neg_far)
         w_lift_pos = float(w_lift_pos_far)
@@ -222,6 +232,8 @@ def compute_instruction_reward(
         w_xyz_pos = float(w_xyz_pos_near)
         w_xyz_neg = float(w_xyz_neg_near)
         w_orient = float(w_orient_near)
+        w_gripper_orient = float(w_gripper_orient_near)
+        w_camera_orient = float(w_camera_orient_near)
         w_obj_pos = float(w_obj_pos_near)
         w_obj_neg = float(w_obj_neg_near)
         w_lift_pos = float(w_lift_pos_near)
@@ -245,9 +257,41 @@ def compute_instruction_reward(
         turning_toward = float(max(heading_toward - reward_state.prev_heading_toward, 0.0))
     reward_state.prev_heading_toward = heading_toward
 
+    if gripper_surface_alignment is None:
+        gripper_surface_align = heading_toward
+    else:
+        gripper_surface_align = float(np.clip(gripper_surface_alignment, 0.0, 1.0))
+    gripper_surface_turning = 0.0
+    if reward_state.prev_gripper_surface_align is not None:
+        gripper_surface_turning = float(
+            max(gripper_surface_align - reward_state.prev_gripper_surface_align, 0.0)
+        )
+    reward_state.prev_gripper_surface_align = gripper_surface_align
+
+    if camera_alignment is None:
+        camera_align = heading_toward
+    else:
+        camera_align = float(np.clip(camera_alignment, 0.0, 1.0))
+    camera_turning = 0.0
+    if reward_state.prev_camera_align is not None:
+        camera_turning = float(max(camera_align - reward_state.prev_camera_align, 0.0))
+    reward_state.prev_camera_align = camera_align
+
     orientation_gate = float(ee_obj_dist <= orient_gate_distance)
-    orientation_raw = float(heading_toward + 0.5 * turning_toward)
-    orientation_reward = float(w_orient * orientation_gate * orientation_raw)
+    heading_orientation_raw = float(heading_toward + 0.5 * turning_toward)
+    gripper_orientation_raw = float(gripper_surface_align + 0.5 * gripper_surface_turning)
+    camera_orientation_raw = float(camera_align + 0.5 * camera_turning)
+    heading_orientation_reward = float(w_orient * orientation_gate * heading_orientation_raw)
+    gripper_orientation_reward = float(
+        w_gripper_orient * orientation_gate * gripper_orientation_raw
+    )
+    camera_orientation_reward = float(w_camera_orient * orientation_gate * camera_orientation_raw)
+    orientation_raw = float(
+        heading_orientation_raw + gripper_orientation_raw + camera_orientation_raw
+    )
+    orientation_reward = float(
+        heading_orientation_reward + gripper_orientation_reward + camera_orientation_reward
+    )
 
     motion_action_norm = 0.0
     idle_action_penalty = 0.0
@@ -379,7 +423,17 @@ def compute_instruction_reward(
         "follow_score": follows_ee,
         "heading_toward_target": heading_toward,
         "turning_toward_target": turning_toward,
+        "gripper_surface_alignment": gripper_surface_align,
+        "gripper_surface_turning": gripper_surface_turning,
+        "camera_alignment": camera_align,
+        "camera_turning": camera_turning,
         "orientation_gate": orientation_gate,
+        "heading_orientation_raw": heading_orientation_raw,
+        "gripper_orientation_raw": gripper_orientation_raw,
+        "camera_orientation_raw": camera_orientation_raw,
+        "heading_orientation_reward": heading_orientation_reward,
+        "gripper_orientation_reward": gripper_orientation_reward,
+        "camera_orientation_reward": camera_orientation_reward,
         "orientation_raw": orientation_raw,
         "orientation_reward": orientation_reward,
         "motion_action_norm": motion_action_norm,

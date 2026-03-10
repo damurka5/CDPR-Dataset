@@ -540,6 +540,8 @@ class CDPRLanguageRLEnv(_EnvBase):
 
         ee = self._get_ee_position()
         obj = self._get_body_position(self._target_body_name)
+        gripper_surface_alignment = self._get_gripper_surface_alignment(obj_pos=obj)
+        camera_alignment = self._get_ee_camera_alignment(obj_pos=obj)
         ee_yaw_for_reward: Optional[float] = None
         if hasattr(self.sim, "set_yaw") or hasattr(self.sim, "get_yaw"):
             ee_yaw_for_reward = float(self._yaw)
@@ -550,6 +552,8 @@ class CDPRLanguageRLEnv(_EnvBase):
             reward_state=self._reward_state,
             action=action,
             ee_yaw=ee_yaw_for_reward,
+            gripper_surface_alignment=gripper_surface_alignment,
+            camera_alignment=camera_alignment,
             gripper_command=float(self._last_gripper_cmd),
         )
         caught_body, caught_catalog, caught_score, caught_is_target = self._detect_caught_object(ee_pos=ee)
@@ -825,6 +829,65 @@ class CDPRLanguageRLEnv(_EnvBase):
         if bid == -1:
             raise RuntimeError(f"Body '{body_name}' not found in MuJoCo model.")
         return np.asarray(self.sim.data.body_xpos[bid], dtype=np.float32).copy()
+
+    def _get_geom_position(self, geom_name: str) -> Optional[np.ndarray]:
+        gid = mj.mj_name2id(self.sim.model, mj.mjtObj.mjOBJ_GEOM, geom_name)
+        if gid == -1:
+            return None
+        return np.asarray(self.sim.data.geom_xpos[gid], dtype=np.float32).copy()
+
+    def _get_gripper_surface_alignment(self, obj_pos: np.ndarray) -> Optional[float]:
+        """
+        Alignment for the requirement:
+        stick surface ⟂ line(to object)  => line aligns with stick-surface normal.
+        We approximate the normal by the left-right finger separation axis.
+        """
+        left = self._get_geom_position("finger_l_link")
+        right = self._get_geom_position("finger_r_link")
+        if left is None or right is None:
+            # Fallback to tips if link geoms are unavailable.
+            left = self._get_geom_position("finger_l_tip")
+            right = self._get_geom_position("finger_r_tip")
+        if left is None or right is None:
+            return None
+
+        surface_normal_xy = right[:2] - left[:2]
+        norm_surface = float(np.linalg.norm(surface_normal_xy))
+        if norm_surface < 1e-8:
+            return None
+        surface_normal_xy /= norm_surface
+
+        gripper_center_xy = 0.5 * (right[:2] + left[:2])
+        to_obj_xy = np.asarray(obj_pos[:2] - gripper_center_xy, dtype=np.float32)
+        norm_obj = float(np.linalg.norm(to_obj_xy))
+        if norm_obj < 1e-8:
+            return 1.0
+        to_obj_xy /= norm_obj
+
+        # Absolute because either finger can face the target.
+        return float(np.clip(abs(np.dot(surface_normal_xy, to_obj_xy)), 0.0, 1.0))
+
+    def _get_ee_camera_alignment(self, obj_pos: np.ndarray) -> Optional[float]:
+        cam_id = mj.mj_name2id(self.sim.model, mj.mjtObj.mjOBJ_CAMERA, "ee_camera")
+        if cam_id == -1:
+            return None
+
+        cam_pos = np.asarray(self.sim.data.cam_xpos[cam_id], dtype=np.float32)
+        cam_xmat = np.asarray(self.sim.data.cam_xmat[cam_id], dtype=np.float32).reshape(3, 3)
+        # MuJoCo fixed camera forward direction is local -Z in world frame.
+        cam_forward = -cam_xmat[:, 2]
+        norm_forward = float(np.linalg.norm(cam_forward))
+        if norm_forward < 1e-8:
+            return None
+        cam_forward /= norm_forward
+
+        to_obj = np.asarray(obj_pos - cam_pos, dtype=np.float32)
+        norm_to_obj = float(np.linalg.norm(to_obj))
+        if norm_to_obj < 1e-8:
+            return 1.0
+        to_obj /= norm_to_obj
+
+        return float(np.clip(np.dot(cam_forward, to_obj), 0.0, 1.0))
 
     def _apply_action(self, action: np.ndarray):
         ee = self._get_ee_position()
