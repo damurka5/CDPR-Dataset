@@ -461,6 +461,7 @@ class CDPRLanguageRLEnv(_EnvBase):
             self.sim.hold_current_pose(warm_steps=10)
         self._refresh_workspace_safety()
         self._move_ee_to_spawn_height()
+        self._clear_sim_recording_buffers()
 
         self._catalog_to_body, self._object_body_names = self._resolve_objects(scene.objects)
         self._inverse_catalog_to_body = {v: k for k, v in self._catalog_to_body.items()}
@@ -675,6 +676,17 @@ class CDPRLanguageRLEnv(_EnvBase):
         obj_part = "-".join(sorted(scene.objects))
         stamp = int(time.time_ns())
         return self.wrapper_dir / f"{scene.name}__{obj_part}__rltmp_{stamp}.xml"
+
+    def _clear_sim_recording_buffers(self):
+        if self.sim is None:
+            return
+        # Reset any simulator-side logs so reset-time warmup motion never appears in saved episodes.
+        for attr in ("trajectory_data", "overview_frames", "ee_camera_frames"):
+            if hasattr(self.sim, attr):
+                try:
+                    setattr(self.sim, attr, [])
+                except Exception:
+                    pass
 
     def _register_cleanup_path(self, path: Path):
         p = Path(path).resolve()
