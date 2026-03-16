@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Teleop data collection for CDPR + desk texture randomization/augmentation.
 
@@ -43,7 +45,7 @@ from pynput import keyboard
 from cdpr_mujoco.headless_cdpr_egl import HeadlessCDPRSimulation
 
 # reuse your existing helpers (same as teleop_cdpr_collect.py)
-from .generate_cdpr_dataset import build_wrapper_if_needed
+from .generate_cdpr_dataset import build_wrapper_if_needed, list_wrapper_bundle_paths
 from .synthetic_tasks import clamp_xyz, task_language
 
 
@@ -655,6 +657,47 @@ def _cleanup_generated_wrappers(created_paths: list[Path], variant_tags: list[st
         _safe_unlink(p)
 
 
+def _copy_wrapper_bundle(src_wrapper_xml: Path, dst_wrapper_xml: Path) -> list[Path]:
+    src_wrapper_xml = src_wrapper_xml.resolve()
+    dst_wrapper_xml = dst_wrapper_xml.resolve()
+
+    bundle_paths = [p.resolve() for p in list_wrapper_bundle_paths(src_wrapper_xml)]
+    mapping: dict[Path, Path] = {src_wrapper_xml: dst_wrapper_xml}
+    src_prefix = f"{src_wrapper_xml.stem}__"
+    dst_prefix = f"{dst_wrapper_xml.stem}__"
+
+    for dep in bundle_paths[1:]:
+        dep_name = dep.name
+        if dep_name.startswith(src_prefix):
+            dep_name = f"{dst_prefix}{dep_name[len(src_prefix):]}"
+        else:
+            dep_name = f"{dst_prefix}{dep_name}"
+        mapping[dep] = dst_wrapper_xml.parent / dep_name
+
+    copied_paths: list[Path] = []
+    for src_path, dst_path in mapping.items():
+        shutil.copy2(src_path, dst_path)
+        copied_paths.append(dst_path)
+
+    tree = ET.parse(dst_wrapper_xml)
+    root = tree.getroot()
+    changed = False
+    for inc, file_attr in _iter_includes(root):
+        src_include = _resolve_include_path(src_wrapper_xml, file_attr)
+        dst_include = mapping.get(src_include.resolve())
+        if dst_include is None:
+            continue
+        new_attr = _relpath_or_abs(dst_include, dst_wrapper_xml.parent)
+        if file_attr != new_attr:
+            inc.set("file", new_attr)
+            changed = True
+
+    if changed:
+        tree.write(dst_wrapper_xml, encoding="utf-8", xml_declaration=True)
+
+    return copied_paths
+
+
 def load_catalog(catalog_path: str):
     import yaml
     with open(catalog_path, "r") as f:
@@ -788,7 +831,7 @@ def main():
 
         # If force rebuild: delete cached wrapper(s) for this scene (simple heuristic)
         if args.force_rebuild_wrapper and not args.wrapper_xml:
-            for p in WRAP_DIR.glob(f"{scene_name}__*_wrapper.xml"):
+            for p in WRAP_DIR.glob(f"{scene_name}__*.xml"):
                 try:
                     p.unlink()
                     print(f"🧹 Removed cached wrapper: {p}")
@@ -809,8 +852,7 @@ def main():
                     if not src_wrapper_xml.exists():
                         raise SystemExit(f"--wrapper_xml not found: {src_wrapper_xml}")
                     wrapper_xml = WRAP_DIR / f"{src_wrapper_xml.stem}__teleopsrc_{int(time.time_ns())}.xml"
-                    shutil.copy2(src_wrapper_xml, wrapper_xml)
-                    created_paths.append(wrapper_xml)
+                    created_paths.extend(_copy_wrapper_bundle(src_wrapper_xml, wrapper_xml))
                 else:
                     wrapper_out = WRAP_DIR / (
                         f"{scene_name}__{'-'.join(sorted(object_names))}__teleoptmp_{int(time.time_ns())}.xml"
@@ -825,7 +867,7 @@ def main():
                         wrapper_out=wrapper_out,
                         use_cache=False,
                     )
-                    created_paths.append(wrapper_xml)
+                    created_paths.extend(list_wrapper_bundle_paths(wrapper_xml))
 
                 wrapper_base = patch_wrapper_includes(wrapper_xml, WRAP_DIR) if args.patch_wrapper_paths else wrapper_xml
                 if wrapper_base != wrapper_xml:

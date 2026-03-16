@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 # Generate synthetic CDPR dataset (RLDS/Open-X style) without writing into VLA_CDPR.
 # - Builds/uses a cached wrapper under cdpr_dataset/wrappers/ per (scene, objects) combo
 # - Waypointed EE motion (up → above → down) with 3 cm tolerance
 # - Simple non-overlap object placement near the workspace center
 # - Unique per-episode output directories (no overwrites)
 
-import os, sys, yaml, argparse, subprocess
-from pathlib import Path
+import argparse
 from datetime import datetime
-import math, random
+import math
+import os
+from pathlib import Path
+import random
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+import yaml
 import numpy as np
 
 from cdpr_mujoco.headless_cdpr_egl import HeadlessCDPRSimulation
@@ -60,6 +70,95 @@ def load_catalog(catalog_path: str):
 def _wrapper_name(scene: str, object_names: list[str]) -> str:
     objs = "-".join(sorted(object_names))
     return f"{scene}__{objs}_wrapper.xml"
+
+
+def _resolve_include_path(current_xml: Path, file_attr: str) -> Path:
+    include_path = Path(file_attr)
+    if include_path.is_absolute():
+        return include_path.resolve()
+    return (current_xml.parent / include_path).resolve()
+
+
+def _iter_local_wrapper_dependencies(wrapper_xml: Path) -> list[Path]:
+    wrapper_path = wrapper_xml.resolve()
+    seen = {wrapper_path}
+    queue = [wrapper_path]
+    deps: list[Path] = []
+
+    while queue:
+        current_xml = queue.pop()
+        if not current_xml.exists():
+            continue
+        try:
+            root = ET.parse(current_xml).getroot()
+        except ET.ParseError:
+            continue
+
+        for include in root.iter("include"):
+            file_attr = include.get("file")
+            if not file_attr:
+                continue
+            include_path = _resolve_include_path(current_xml, file_attr)
+            if include_path in seen or include_path.parent != wrapper_path.parent:
+                continue
+            seen.add(include_path)
+            deps.append(include_path)
+            queue.append(include_path)
+
+    return deps
+
+
+def list_wrapper_bundle_paths(wrapper_xml: str | Path) -> list[Path]:
+    wrapper_path = Path(wrapper_xml).expanduser().resolve()
+    bundle_paths = [wrapper_path]
+    bundle_paths.extend(_iter_local_wrapper_dependencies(wrapper_path))
+    return bundle_paths
+
+
+def _wrapper_bundle_isolated(wrapper_xml: Path) -> bool:
+    wrapper_path = wrapper_xml.resolve()
+    prefix = f"{wrapper_path.stem}__"
+    for dep in _iter_local_wrapper_dependencies(wrapper_path):
+        if not dep.name.startswith(prefix):
+            return False
+    return True
+
+
+def _isolate_wrapper_bundle(wrapper_xml: Path) -> list[Path]:
+    wrapper_path = wrapper_xml.resolve()
+    if not wrapper_path.exists():
+        return []
+
+    tree = ET.parse(wrapper_path)
+    root = tree.getroot()
+    prefix = f"{wrapper_path.stem}__"
+    created: list[Path] = []
+    changed = False
+
+    for include in root.iter("include"):
+        file_attr = include.get("file")
+        if not file_attr:
+            continue
+        include_path = _resolve_include_path(wrapper_path, file_attr)
+        if include_path.parent != wrapper_path.parent or not include_path.exists():
+            continue
+
+        isolated_path = include_path
+        if not include_path.name.startswith(prefix):
+            isolated_path = wrapper_path.parent / f"{prefix}{include_path.name}"
+            if isolated_path != include_path:
+                shutil.copy2(include_path, isolated_path)
+                created.append(isolated_path)
+
+        rel_include = isolated_path.relative_to(wrapper_path.parent).as_posix()
+        if file_attr != rel_include:
+            include.set("file", rel_include)
+            changed = True
+
+    if changed:
+        tree.write(wrapper_path, encoding="utf-8", xml_declaration=True)
+
+    return created
 
 def _auto_detect_object_body(sim, preferred: str | None = None) -> str:
     import mujoco as mj
@@ -158,10 +257,12 @@ def build_wrapper_if_needed(scene_name: str,
         wrapper_path.parent.mkdir(parents=True, exist_ok=True)
 
     if use_cache and wrapper_path.exists():
-        print(f"✅ Using cached wrapper: {wrapper_path}")
-        return wrapper_path
+        if _wrapper_bundle_isolated(wrapper_path):
+            print(f"✅ Using cached wrapper: {wrapper_path}")
+            return wrapper_path
+        print(f"♻️ Rebuilding cached wrapper with isolated includes: {wrapper_path}")
 
-    if (not use_cache) and wrapper_path.exists():
+    if wrapper_path.exists():
         try:
             wrapper_path.unlink()
         except Exception:
@@ -321,6 +422,9 @@ def build_wrapper_if_needed(scene_name: str,
             )
 
     print(f"✅ Built wrapper: {wrapper_path}\n   Includes {len(object_names)} object(s).")
+    created_bundle_files = _isolate_wrapper_bundle(wrapper_path)
+    if created_bundle_files:
+        print(f"📦 Isolated wrapper bundle files: {len(created_bundle_files)}")
     return wrapper_path
 
 

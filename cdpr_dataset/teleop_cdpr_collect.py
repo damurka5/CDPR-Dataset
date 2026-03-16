@@ -345,7 +345,7 @@ def main():
 
         # If force rebuild: delete cached wrapper(s) for this scene (simple heuristic)
         if args.force_rebuild_wrapper and not args.wrapper_xml:
-            for p in WRAP_DIR.glob(f"{scene_name}__*_wrapper.xml"):
+            for p in WRAP_DIR.glob(f"{scene_name}__*.xml"):
                 try:
                     p.unlink()
                     print(f"🧹 Removed cached wrapper: {p}")
